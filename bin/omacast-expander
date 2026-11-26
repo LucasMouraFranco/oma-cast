@@ -1,0 +1,1273 @@
+#!/usr/bin/env python3
+"""omacast-expander: keyword expansion for omacast's Snippets (SPEC §5.4).
+
+Type a snippet's keyword anywhere ("lmail") and it is replaced with the
+snippet ("you@example.com") the moment the last character lands. Ported from
+the Shorthand plugin's engine, which the omacast shell plugin now runs.
+
+How it works, and why it is fast:
+
+* Keystrokes are read passively from the keyboards in /dev/input (evdev). Nothing
+  is grabbed, so every key still reaches Hyprland exactly as before. Keys are
+  turned into characters with libxkbcommon using the same layout, variant and
+  options Hyprland uses, including compose and dead keys.
+* The replacement is typed through the Wayland virtual-keyboard protocol over
+  one connection that stays open for the life of the process. An expansion is a
+  keymap upload and a burst of key events written to a socket: no process is
+  spawned, nothing sleeps between keys, and nothing touches the clipboard.
+
+The keyword table arrives on stdin from the shell (Backend.qml), one JSON
+line per change; snippet text never appears in any argv or file of ours. A
+snippet with placeholders ({date}, {cursor}, ...) is resolved by the shell: we
+report the keyword and type what it sends back.
+
+Only the last few characters (as many as the longest keyword) are kept, only
+in memory, and nothing typed is ever logged.
+
+Standard library only; needs libxkbcommon, which every Hyprland system has.
+"""
+
+import ctypes
+import ctypes.util
+import errno
+import json
+import os
+import selectors
+import shutil
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import time
+
+VERSION = "1.0.0"
+
+MAX_KEYWORD = 64
+MAX_TEXT = 20000
+MAX_SNIPPETS = 2000
+
+# How long after the keyword's last key the replacement starts. Long enough
+# that Hyprland has certainly delivered that key before the first backspace
+# arrives (both read the same keyboard at the same instant), far too short to
+# see: a 60 Hz frame is 16 ms.
+DEFAULT_DELAY_MS = 8
+
+UDEV_RULE_PATH = "/etc/udev/rules.d/70-omacast.rules"
+# uaccess hands the logged-in seat user an ACL on keyboards and pointers, the
+# way logind already does for sound cards and GPUs. It must sort before
+# 73-seat-late.rules, which is where the ACL is actually applied.
+UDEV_RULE = """\
+# omacast keyword expansion (Snippets): let the logged-in user read keyboards, and
+# mouse buttons so a click can reset what was being typed.
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_KEYBOARD}=="1", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_MOUSE}=="1", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_TOUCHPAD}=="1", TAG+="uaccess"
+"""
+
+
+def debug(*args):
+    if os.environ.get("OMACAST_EXPANDER_DEBUG"):
+        print("omacast-expander:", *args, file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------- table
+
+
+def valid_keyword(keyword):
+    return (
+        isinstance(keyword, str)
+        and 0 < len(keyword) <= MAX_KEYWORD
+        and not any(ord(c) < 32 or ord(c) == 127 for c in keyword)
+        and keyword.strip() != ""
+    )
+
+
+def normalize_table(entries):
+    """The shell's keyword table, cleaned: [{keyword, text, dynamic}]. Never
+    raises. The first entry for a keyword wins; the shell keeps them unique."""
+    out, seen = [], set()
+    for e in entries if isinstance(entries, list) else []:
+        if len(out) >= MAX_SNIPPETS:
+            break
+        if not isinstance(e, dict):
+            continue
+        keyword, text, dynamic = e.get("keyword"), e.get("text"), e.get("dynamic") is True
+        if not valid_keyword(keyword) or keyword in seen:
+            continue
+        if not isinstance(text, str):
+            if not dynamic:
+                continue
+            text = ""
+        seen.add(keyword)
+        out.append({"keyword": keyword, "text": text[:MAX_TEXT], "dynamic": dynamic})
+    return out
+
+
+# -------------------------------------------------------------------- matching
+
+
+class Matcher:
+    """Longest keyword that the typed text currently ends with."""
+
+    def __init__(self, entries):
+        self.table = {e["keyword"]: (e["text"], e["dynamic"]) for e in entries}
+        self.lengths = sorted({len(t) for t in self.table}, reverse=True)
+        self.maxlen = self.lengths[0] if self.lengths else 0
+
+    def match(self, typed):
+        for n in self.lengths:
+            if n <= len(typed):
+                tail = typed[-n:]
+                if tail in self.table:
+                    text, dynamic = self.table[tail]
+                    return tail, text, dynamic
+        return None
+
+
+class Typed:
+    """The tail of what was typed since the last reset, capped to `limit`."""
+
+    def __init__(self, limit=MAX_KEYWORD):
+        self.limit = limit
+        self.text = ""
+
+    def add(self, s):
+        self.text = (self.text + s)[-self.limit:] if self.limit else ""
+
+    def backspace(self):
+        self.text = self.text[:-1]
+
+    def reset(self):
+        self.text = ""
+
+
+def key_plan(backspaces, text, left=0):
+    """The keys that replace a keyword: names for xkb, in typing order.
+    left: Left presses after the text, to put the caret at {cursor}."""
+    keys = ["BackSpace"] * backspaces
+    for ch in text:
+        if ch == "\n":
+            keys.append("Return")
+        elif ch == "\t":
+            keys.append("Tab")
+        elif ch == "\r" or (ord(ch) < 32 and ch not in "\n\t") or 0xD800 <= ord(ch) <= 0xDFFF:
+            continue
+        else:
+            keys.append(ch)
+    keys += ["Left"] * max(0, min(int(left), MAX_TEXT))
+    return keys
+
+
+# ----------------------------------------------------------------- xkbcommon
+
+XKB_KEY_DOWN, XKB_KEY_UP = 1, 0
+XKB_STATE_MODS_DEPRESSED, XKB_STATE_MODS_LATCHED, XKB_STATE_MODS_LOCKED = 1, 2, 4
+XKB_STATE_MODS_EFFECTIVE = 8
+XKB_COMPOSE_FEED_ACCEPTED = 1
+XKB_COMPOSE_NOTHING, XKB_COMPOSE_COMPOSING, XKB_COMPOSE_COMPOSED, XKB_COMPOSE_CANCELLED = 0, 1, 2, 3
+
+KEYSYM_BACKSPACE = 0xFF08
+
+
+def is_modifier_keysym(sym):
+    return (
+        0xFFE1 <= sym <= 0xFFEE  # Shift, Control, Caps/Shift Lock, Meta, Alt, Super, Hyper
+        or 0xFE01 <= sym <= 0xFE13  # ISO level 3/5 shifts and latches, group switches
+        or sym in (0xFF7E, 0xFF7F)  # Mode_switch, Num_Lock
+    )
+
+
+class RuleNames(ctypes.Structure):
+    _fields_ = [(n, ctypes.c_char_p) for n in ("rules", "model", "layout", "variant", "options")]
+
+
+class Xkb:
+    def __init__(self):
+        name = ctypes.util.find_library("xkbcommon") or "libxkbcommon.so.0"
+        lib = self.lib = ctypes.CDLL(name)
+        vp, u32, i, sz, cp = ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_size_t, ctypes.c_char_p
+
+        def fn(n, res, *args):
+            f = getattr(lib, n)
+            f.restype, f.argtypes = res, list(args)
+            return f
+
+        self.context_new = fn("xkb_context_new", vp, i)
+        self.keymap_new_from_names = fn("xkb_keymap_new_from_names", vp, vp, ctypes.POINTER(RuleNames), i)
+        self.keymap_unref = fn("xkb_keymap_unref", None, vp)
+        self.keymap_num_layouts = fn("xkb_keymap_num_layouts", u32, vp)
+        self.keymap_mod_get_index = fn("xkb_keymap_mod_get_index", u32, vp, cp)
+        self.state_new = fn("xkb_state_new", vp, vp)
+        self.state_unref = fn("xkb_state_unref", None, vp)
+        self.state_update_key = fn("xkb_state_update_key", i, vp, u32, i)
+        self.state_update_mask = fn("xkb_state_update_mask", i, vp, u32, u32, u32, u32, u32, u32)
+        self.state_serialize_mods = fn("xkb_state_serialize_mods", u32, vp, i)
+        self.state_key_get_one_sym = fn("xkb_state_key_get_one_sym", u32, vp, u32)
+        self.state_key_get_utf8 = fn("xkb_state_key_get_utf8", i, vp, u32, cp, sz)
+        self.state_mod_name_is_active = fn("xkb_state_mod_name_is_active", i, vp, cp, i)
+        self.utf32_to_keysym = fn("xkb_utf32_to_keysym", u32, u32)
+        self.keysym_from_name = fn("xkb_keysym_from_name", u32, cp, i)
+        self.keysym_get_name = fn("xkb_keysym_get_name", i, u32, cp, sz)
+        try:
+            self.compose_table_new_from_locale = fn("xkb_compose_table_new_from_locale", vp, vp, cp, i)
+            self.compose_state_new = fn("xkb_compose_state_new", vp, vp, i)
+            self.compose_state_unref = fn("xkb_compose_state_unref", None, vp)
+            self.compose_state_feed = fn("xkb_compose_state_feed", i, vp, u32)
+            self.compose_state_reset = fn("xkb_compose_state_reset", None, vp)
+            self.compose_state_get_status = fn("xkb_compose_state_get_status", i, vp)
+            self.compose_state_get_utf8 = fn("xkb_compose_state_get_utf8", i, vp, cp, sz)
+        except AttributeError:
+            self.compose_table_new_from_locale = None
+        self.ctx = self.context_new(0)
+        if not self.ctx:
+            raise RuntimeError("xkb_context_new failed")
+        self.compose_table = None
+        if self.compose_table_new_from_locale:
+            for loc in (os.environ.get("LC_ALL"), os.environ.get("LC_CTYPE"), os.environ.get("LANG"), "C"):
+                if loc:
+                    self.compose_table = self.compose_table_new_from_locale(self.ctx, loc.encode(), 0)
+                    if self.compose_table:
+                        break
+
+    def keymap(self, rules="", model="", layout="", variant="", options=""):
+        def enc(s):
+            return s.encode() if s else None
+
+        names = RuleNames(enc(rules), enc(model), enc(layout or "us"), enc(variant), enc(options))
+        km = self.keymap_new_from_names(self.ctx, ctypes.byref(names), 0)
+        if not km and options:
+            # An option this libxkbcommon cannot resolve should cost the option,
+            # not the whole layout.
+            names.options = None
+            km = self.keymap_new_from_names(self.ctx, ctypes.byref(names), 0)
+        if not km:
+            names = RuleNames(None, None, b"us", None, None)
+            km = self.keymap_new_from_names(self.ctx, ctypes.byref(names), 0)
+        return km
+
+    def keysym_name(self, ch):
+        sym = self.utf32_to_keysym(ord(ch))
+        if not sym:
+            return None
+        buf = ctypes.create_string_buffer(64)
+        n = self.keysym_get_name(sym, buf, 64)
+        return buf.value.decode() if n > 0 else None
+
+    def utf8(self, fn, *args):
+        buf = ctypes.create_string_buffer(64)
+        n = fn(*args, buf, 64)
+        if n <= 0:
+            return ""
+        return buf.raw[: min(n, 63)].decode("utf-8", "replace")
+
+
+class KeyState:
+    """xkb + compose state for one physical keyboard."""
+
+    def __init__(self, xkb, keymap, layout_index=0, locked_mods=0):
+        self.xkb = xkb
+        self.state = xkb.state_new(keymap)
+        self.compose = xkb.compose_state_new(xkb.compose_table, 0) if xkb.compose_table else None
+        if locked_mods:
+            xkb.state_update_mask(self.state, 0, 0, locked_mods, 0, 0, 0)
+        self.set_layout(layout_index)
+
+    def close(self):
+        if self.state:
+            self.xkb.state_unref(self.state)
+        if self.compose:
+            self.xkb.compose_state_unref(self.compose)
+        self.state = self.compose = None
+
+    def set_layout(self, index):
+        x, s = self.xkb, self.state
+        x.state_update_mask(
+            s,
+            x.state_serialize_mods(s, XKB_STATE_MODS_DEPRESSED),
+            x.state_serialize_mods(s, XKB_STATE_MODS_LATCHED),
+            x.state_serialize_mods(s, XKB_STATE_MODS_LOCKED),
+            0, 0, max(0, int(index)),
+        )
+
+    def mod_active(self, name):
+        return self.xkb.state_mod_name_is_active(self.state, name, XKB_STATE_MODS_EFFECTIVE) > 0
+
+    def press(self, keycode):
+        """What a key press types: ("text", s), ("backspace",), ("reset",) or ("ignore",)."""
+        x, s = self.xkb, self.state
+        sym = x.state_key_get_one_sym(s, keycode)
+        if is_modifier_keysym(sym):
+            return ("ignore",)
+        if self.mod_active(b"Control") or self.mod_active(b"Mod1") or self.mod_active(b"Mod4"):
+            # A shortcut, not typing; whatever it does to the text is unknowable.
+            self.reset_compose()
+            return ("reset",)
+        if sym == KEYSYM_BACKSPACE:
+            self.reset_compose()
+            return ("backspace",)
+        if self.compose and x.compose_state_feed(self.compose, sym) == XKB_COMPOSE_FEED_ACCEPTED:
+            status = x.compose_state_get_status(self.compose)
+            if status == XKB_COMPOSE_COMPOSING:
+                return ("ignore",)
+            if status == XKB_COMPOSE_CANCELLED:
+                self.reset_compose()
+                return ("ignore",)
+            if status == XKB_COMPOSE_COMPOSED:
+                text = x.utf8(x.compose_state_get_utf8, self.compose)
+                self.reset_compose()
+                return ("text", text) if text else ("ignore",)
+        text = x.utf8(x.state_key_get_utf8, s, keycode)
+        if not text or any(ord(c) < 32 or ord(c) == 127 for c in text):
+            # Enter, Tab, Escape, arrows, Home, Delete, F-keys: the caret moved or
+            # the text was committed, so what came before no longer leads anywhere.
+            return ("reset",)
+        return ("text", text)
+
+    def reset_compose(self):
+        if self.compose:
+            self.xkb.compose_state_reset(self.compose)
+
+    def update(self, keycode, down):
+        self.xkb.state_update_key(self.state, keycode, XKB_KEY_DOWN if down else XKB_KEY_UP)
+
+
+# ------------------------------------------------------- Wayland virtual keyboard
+
+
+# Every character goes on the key a US keyboard really has it on: "." on the
+# period key, "@" as Shift+2, Backspace on Backspace. Apps that look at which
+# physical key was pressed (Chromium's DOM `code`, many web editors, some IMEs)
+# then see the same thing as apps that look at the character. Putting symbols
+# on arbitrary keycodes instead made "." arrive on Backspace's keycode and
+# delete the character before it.
+US_KEYS = (
+    [(41, "`", "~")]
+    + [(2 + i, d, s) for i, (d, s) in enumerate(zip("1234567890", "!@#$%^&*()"))]
+    + [(12, "-", "_"), (13, "=", "+")]
+    + [(16 + i, c, c.upper()) for i, c in enumerate("qwertyuiop")]
+    + [(26, "[", "{"), (27, "]", "}"), (43, "\\", "|")]
+    + [(30 + i, c, c.upper()) for i, c in enumerate("asdfghjkl")]
+    + [(39, ";", ":"), (40, "'", '"')]
+    + [(44 + i, c, c.upper()) for i, c in enumerate("zxcvbnm")]
+    + [(51, ",", "<"), (52, ".", ">"), (53, "/", "?")]
+)
+NAMED_KEYS = {"BackSpace": 14, "Tab": 15, "Return": 28, "space": 57, "Left": 105}
+# Characters a US keyboard does not have (ã, é, emoji) go on keys nothing reads
+# as editing keys: F13-F24 and the unassigned codes after them.
+EXTRA_CODES = list(range(183, 200))
+
+
+def us_positions():
+    """char -> (evdev code, shift)"""
+    pos = {" ": (57, False)}
+    for code, plain, shifted in US_KEYS:
+        pos[plain] = (code, False)
+        pos[shifted] = (code, True)
+    return pos
+
+
+US_POSITIONS = us_positions()
+
+
+def plan_chunks(keys, avoid=()):
+    """Split a key plan into chunks of (extras, events).
+
+    avoid: evdev codes physically held down right now. A key that is already
+    down cannot be pressed again (the press is dropped), and the keyword's last
+    key usually is still down when the expansion starts, so characters on those
+    keys are typed from a spare key instead, like ã or é.
+
+    extras: the non-US characters that chunk's keymap puts on EXTRA_CODES.
+    events: (evdev code, shift) in typing order.
+    A new chunk (and keymap) starts only when more distinct non-US characters
+    are needed than there are spare keys."""
+    chunks, extras, index, events = [], [], {}, []
+    for k in keys:
+        if k in NAMED_KEYS:
+            events.append((NAMED_KEYS[k], False))
+        elif k in US_POSITIONS and US_POSITIONS[k][0] not in avoid:
+            events.append(US_POSITIONS[k])
+        else:
+            if k not in index:
+                if len(extras) == len(EXTRA_CODES):
+                    chunks.append((extras, events))
+                    extras, index, events = [], {}, []
+                index[k] = EXTRA_CODES[len(extras)]
+                extras.append(k)
+            events.append((index[k], False))
+    if events:
+        chunks.append((extras, events))
+    return chunks
+
+
+def keymap_text(extra_symbols=()):
+    """A US keymap (two levels, Shift for the second) plus one single-level key
+    per extra keysym name on EXTRA_CODES."""
+    def name(ch):
+        return KEYSYM_NAMES.get(ch) or "U%04X" % ord(ch)
+
+    keys = [(code, "[ %s, %s ]" % (name(p), name(s))) for code, p, s in US_KEYS]
+    keys += [(code, "[ %s ]" % sym) for sym, code in NAMED_KEYS.items()]
+    keys += [(EXTRA_CODES[i], "[ %s ]" % sym) for i, sym in enumerate(extra_symbols)]
+    codes = "\n".join("    <K%d> = %d;" % (code, code + 8) for code, _ in keys)
+    syms = "\n".join("    key <K%d> { %s };" % (code, levels) for code, levels in keys)
+    return (
+        "xkb_keymap {\n"
+        '  xkb_keycodes "omacast" {\n    minimum = 8;\n    maximum = 255;\n' + codes + "\n  };\n"
+        '  xkb_types "omacast" { include "complete" };\n'
+        '  xkb_compatibility "omacast" { include "complete" };\n'
+        '  xkb_symbols "omacast" {\n' + syms + "\n  };\n"
+        "};\n"
+    )
+
+
+KEYSYM_NAMES = {
+    "`": "grave", "~": "asciitilde", "!": "exclam", "@": "at", "#": "numbersign", "$": "dollar",
+    "%": "percent", "^": "asciicircum", "&": "ampersand", "*": "asterisk", "(": "parenleft",
+    ")": "parenright", "-": "minus", "_": "underscore", "=": "equal", "+": "plus",
+    "[": "bracketleft", "{": "braceleft", "]": "bracketright", "}": "braceright",
+    "\\": "backslash", "|": "bar", ";": "semicolon", ":": "colon", "'": "apostrophe",
+    '"': "quotedbl", ",": "comma", "<": "less", ".": "period", ">": "greater", "/": "slash",
+    "?": "question", " ": "space",
+}
+KEYSYM_NAMES.update({c: c for c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"})
+
+
+def wire_string(s):
+    b = s.encode() + b"\0"
+    return struct.pack("=I", len(b)) + b + b"\0" * (-len(b) % 4)
+
+
+def wire_message(obj, opcode, payload=b""):
+    return struct.pack("=II", obj, ((8 + len(payload)) << 16) | opcode) + payload
+
+
+class WaylandError(Exception):
+    pass
+
+
+class VirtualKeyboard:
+    """A minimal Wayland client: wl_seat + zwp_virtual_keyboard_v1, nothing else."""
+
+    def __init__(self, xkb):
+        self.xkb = xkb
+        self.sock = None
+        self.ids = 1
+        self.inbuf = b""
+        self.current_keymap = None
+        self.connect()
+
+    def _new_id(self):
+        self.ids += 1
+        return self.ids
+
+    def connect(self):
+        display = os.environ.get("WAYLAND_DISPLAY") or "wayland-0"
+        path = display if display.startswith("/") else os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid()), display)
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
+        self.sock.settimeout(2)
+        self.sock.connect(path)
+        self.ids = 1
+        self.inbuf = b""
+        self.current_keymap = None
+        self.registry = self._new_id()
+        self.sock.sendall(wire_message(1, 1, struct.pack("=I", self.registry)))
+        found = {}
+
+        def on_event(obj, op, data):
+            if obj == self.registry and op == 0:
+                name = struct.unpack_from("=I", data, 0)[0]
+                ln = struct.unpack_from("=I", data, 4)[0]
+                iface = data[8:8 + ln - 1].decode()
+                found.setdefault(iface, name)
+
+        self.roundtrip(on_event)
+        if "zwp_virtual_keyboard_manager_v1" not in found or "wl_seat" not in found:
+            raise WaylandError("compositor has no virtual-keyboard support")
+        self.seat = self._new_id()
+        self.manager = self._new_id()
+        self.keyboard = self._new_id()
+        out = self._bind(found["wl_seat"], "wl_seat", 1, self.seat)
+        out += self._bind(found["zwp_virtual_keyboard_manager_v1"], "zwp_virtual_keyboard_manager_v1", 1, self.manager)
+        out += wire_message(self.manager, 0, struct.pack("=II", self.seat, self.keyboard))
+        self.sock.sendall(out)
+        self.roundtrip()
+        self.sock.setblocking(False)
+
+    def _bind(self, name, iface, version, new_id):
+        return wire_message(self.registry, 0, struct.pack("=I", name) + wire_string(iface) + struct.pack("=II", version, new_id))
+
+    def fileno(self):
+        return self.sock.fileno()
+
+    def _dispatch(self, on_event=None):
+        while len(self.inbuf) >= 8:
+            obj, word = struct.unpack_from("=II", self.inbuf, 0)
+            size, op = word >> 16, word & 0xFFFF
+            if size < 8 or len(self.inbuf) < size:
+                break
+            data, self.inbuf = self.inbuf[8:size], self.inbuf[size:]
+            if obj == 1 and op == 0:
+                code = struct.unpack_from("=I", data, 4)[0]
+                ln = struct.unpack_from("=I", data, 8)[0]
+                raise WaylandError("protocol error %d: %s" % (code, data[12:12 + ln - 1].decode("utf-8", "replace")))
+            if on_event:
+                on_event(obj, op, data)
+
+    def _recv(self):
+        data, anc, _flags, _addr = self.sock.recvmsg(65536, socket.CMSG_SPACE(16 * 4))
+        for level, kind, payload in anc:
+            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                for fd in struct.unpack("=%di" % (len(payload) // 4), payload[: len(payload) // 4 * 4]):
+                    os.close(fd)
+        if not data:
+            raise WaylandError("compositor closed the connection")
+        self.inbuf += data
+
+    def roundtrip(self, on_event=None):
+        cb = self._new_id()
+        self.sock.sendall(wire_message(1, 0, struct.pack("=I", cb)))
+        done = []
+
+        def handler(obj, op, data):
+            if obj == cb and op == 0:
+                done.append(True)
+            elif on_event:
+                on_event(obj, op, data)
+
+        self.sock.setblocking(True)
+        self.sock.settimeout(2)
+        try:
+            while not done:
+                self._recv()
+                self._dispatch(handler)
+        finally:
+            self.sock.setblocking(False)
+
+    def drain(self):
+        """Read and drop whatever the compositor sent (seat events, errors)."""
+        try:
+            while True:
+                self._recv()
+        except BlockingIOError:
+            pass
+        self._dispatch()
+
+    def _keymap_message(self, extra_symbols):
+        data = keymap_text(extra_symbols).encode() + b"\0"
+        fd = os.memfd_create("omacast-keymap", os.MFD_CLOEXEC)
+        try:
+            os.write(fd, data)
+            msg = wire_message(self.keyboard, 0, struct.pack("=II", 1, len(data)))
+            return msg, fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def type_keys(self, keys, delay_ms=0, avoid=()):
+        """Type a key plan: single characters, or the names BackSpace, Return, Tab, Left."""
+        self.drain()
+        for extras, events in plan_chunks(keys, avoid):
+            names = [self.xkb.keysym_name(ch) or "U%04X" % ord(ch) for ch in extras]
+            self._send_chunk(names, events, delay_ms)
+        self.drain()
+
+    def _send_chunk(self, extra_names, events, delay_ms):
+        self.sock.setblocking(True)
+        try:
+            if extra_names != self.current_keymap:
+                msg, fd = self._keymap_message(extra_names)
+                try:
+                    self.sock.sendmsg([msg], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("=i", fd))])
+                finally:
+                    os.close(fd)
+                self.current_keymap = extra_names
+            shift = None
+            out = []
+            now = int(time.monotonic() * 1000) & 0xFFFFFFFF
+            for code, shifted in events:
+                if shifted != shift:
+                    # Shift is real modifier bit 0; the US keys are TWO_LEVEL or
+                    # ALPHABETIC, so it selects the second level, as on a keyboard.
+                    out.append(wire_message(self.keyboard, 2, struct.pack("=IIII", 1 if shifted else 0, 0, 0, 0)))
+                    shift = shifted
+                out.append(wire_message(self.keyboard, 1, struct.pack("=III", now, code, 1)))
+                out.append(wire_message(self.keyboard, 1, struct.pack("=III", now, code, 0)))
+                if delay_ms:
+                    self.sock.sendall(b"".join(out))
+                    out = []
+                    time.sleep(delay_ms / 1000)
+                    now = int(time.monotonic() * 1000) & 0xFFFFFFFF
+            if shift:
+                out.append(wire_message(self.keyboard, 2, struct.pack("=IIII", 0, 0, 0, 0)))
+            if out:
+                self.sock.sendall(b"".join(out))
+        finally:
+            self.sock.setblocking(False)
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.setblocking(True)
+                self.sock.sendall(wire_message(self.keyboard, 3))
+            except OSError:
+                pass
+            self.sock.close()
+            self.sock = None
+
+
+class WtypeKeyboard:
+    """Fallback for compositors without virtual-keyboard (it needs the same
+    protocol, so this mostly covers a broken connection)."""
+
+    def __init__(self):
+        if not shutil.which("wtype"):
+            raise WaylandError("wtype not installed")
+
+    def type_keys(self, keys, delay_ms=0, avoid=()):
+        """A key plan is BackSpace*, then text (with Return and Tab), then
+        Left*. The text goes to wtype on stdin ("-"): snippet text never
+        reaches an argv, where other users could read it."""
+        head = 0
+        while head < len(keys) and keys[head] == "BackSpace":
+            head += 1
+        tail = len(keys)
+        while tail > head and keys[tail - 1] == "Left":
+            tail -= 1
+        text = "".join({"Return": "\n", "Tab": "\t", "space": " "}.get(k, k) for k in keys[head:tail])
+        args = ["wtype"]
+        for _ in range(head):
+            args += ["-k", "BackSpace"]
+        if text:
+            args.append("-")
+        for _ in range(len(keys) - tail):
+            args += ["-k", "Left"]
+        if len(args) == 1:
+            return
+        subprocess.run(args, input=text.encode(), check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def close(self):
+        pass
+
+
+def make_injector(xkb):
+    try:
+        return VirtualKeyboard(xkb), "virtual-keyboard"
+    except (OSError, WaylandError) as e:
+        debug("virtual keyboard unavailable:", e)
+        try:
+            return WtypeKeyboard(), "wtype"
+        except WaylandError:
+            return None, None
+
+
+# --------------------------------------------------------------------- devices
+
+EV_SYN, EV_KEY = 0, 1
+SYN_DROPPED = 3
+INPUT_EVENT = struct.Struct("llHHi")
+KEYBOARD_KEYS = (16, 30, 44, 57)  # Q, A, Z, Space
+POINTER_BUTTONS = (0x110, 0x111, 0x112, 0x14A)  # left, right, middle, touch
+
+
+def read_bits(path):
+    try:
+        with open(path) as f:
+            words = f.read().split()
+    except OSError:
+        return 0
+    value = 0
+    for w in words:
+        value = (value << 64) | int(w, 16)
+    return value
+
+
+def classify(event_name, sysfs="/sys/class/input"):
+    base = os.path.join(sysfs, event_name, "device", "capabilities")
+    if not (read_bits(os.path.join(base, "ev")) >> EV_KEY) & 1:
+        return None
+    keys = read_bits(os.path.join(base, "key"))
+    if all((keys >> k) & 1 for k in KEYBOARD_KEYS):
+        return "keyboard"
+    if any((keys >> b) & 1 for b in POINTER_BUTTONS):
+        return "pointer"
+    return None
+
+
+class Device:
+    def __init__(self, path, kind, fd):
+        self.path, self.kind, self.fd = path, kind, fd
+        self.keys = None
+        self.buf = b""
+        self.held = set()
+
+    def fileno(self):
+        return self.fd
+
+
+# --------------------------------------------------------------------- hyprland
+
+
+def hyprctl_json(*args):
+    try:
+        out = subprocess.run(["hyprctl", "-j", *args], capture_output=True, timeout=2, check=False).stdout
+        return json.loads(out or b"null")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def layout_settings():
+    """(rules, model, layout, variant, options, active index), as Hyprland has them."""
+    devices = hyprctl_json("devices")
+    keyboards = devices.get("keyboards", []) if isinstance(devices, dict) else []
+    main = next((k for k in keyboards if k.get("main")), keyboards[0] if keyboards else None)
+    if main:
+        return (main.get("rules", ""), main.get("model", ""), main.get("layout", "") or "us",
+                main.get("variant", ""), main.get("options", ""), int(main.get("active_layout_index", 0) or 0),
+                bool(main.get("capsLock")))
+
+    def opt(name):
+        v = hyprctl_json("getoption", "input:" + name)
+        return v.get("str", "") if isinstance(v, dict) else ""
+
+    return (opt("kb_rules"), opt("kb_model"), opt("kb_layout") or "us", opt("kb_variant"), opt("kb_options"), 0, False)
+
+
+def active_layout_index(keyboard_name=None):
+    devices = hyprctl_json("devices")
+    keyboards = devices.get("keyboards", []) if isinstance(devices, dict) else []
+    pick = next((k for k in keyboards if k.get("name") == keyboard_name), None)
+    pick = pick or next((k for k in keyboards if k.get("main")), None)
+    return int(pick.get("active_layout_index", 0) or 0) if pick else 0
+
+
+def hyprland_events_socket():
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not sig or not runtime:
+        return None
+    for path in (os.path.join(runtime, "hypr", sig, ".socket2.sock"), os.path.join("/tmp/hypr", sig, ".socket2.sock")):
+        if os.path.exists(path):
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM | socket.SOCK_CLOEXEC)
+            try:
+                s.connect(path)
+                s.setblocking(False)
+                return s
+            except OSError:
+                s.close()
+    return None
+
+
+# ---------------------------------------------------------------------- daemon
+
+
+class Daemon:
+    RESCAN_SECONDS = 2.0
+
+    def __init__(self, input_dir="/dev/input", sysfs="/sys/class/input", use_stdin=True):
+        self.input_dir = input_dir
+        self.sysfs = sysfs
+        self.use_stdin = use_stdin
+        self.sel = selectors.DefaultSelector()
+        self.xkb = Xkb()
+        self.keymap = None
+        self.layout_index = 0
+        self.locked_mods = 0
+        self.devices = {}
+        self.denied = set()
+        self.ignored = set()
+        self.typed = Typed()
+        self.paused = False
+        self.pending = None
+        self.matcher = Matcher([])
+        self.stdin_buf = b""
+        self.injector, self.injector_kind = None, None
+        self.hypr = None
+        self.hypr_buf = b""
+        self.last_status = None
+        self.last_rescan = 0.0
+        self.running = True
+        self.scanned = False
+
+    # status for the shell, one JSON object per line on stdout
+    def emit(self, **obj):
+        try:
+            print(json.dumps(obj), flush=True)
+        except (BrokenPipeError, OSError):
+            self.running = False
+
+    def report(self):
+        if not self.scanned:
+            return  # nothing to say until the devices have been looked at
+        keyboards = sum(1 for d in self.devices.values() if d.kind == "keyboard")
+        if self.injector is None:
+            state = "no-injector"
+        elif keyboards:
+            state = "running"
+        elif self.denied:
+            state = "no-access"
+        else:
+            state = "no-keyboards"
+        status = dict(event="status", state=state, keyboards=keyboards, denied=len(self.denied),
+                      injector=self.injector_kind or "", keywords=len(self.matcher.table),
+                      paused=self.paused, version=VERSION)
+        if status != self.last_status:
+            self.last_status = status
+            self.emit(**status)
+
+    # the keyword table, from the shell
+    def set_table(self, entries):
+        self.matcher = Matcher(normalize_table(entries))
+        self.typed.limit = self.matcher.maxlen
+        self.typed.add("")  # trim to the new longest keyword, keep what was typed
+        debug("loaded %d keywords" % len(self.matcher.table))
+
+    # keyboard layout
+    def load_keymap(self):
+        rules, model, layout, variant, options, index, caps = layout_settings()
+        km = self.xkb.keymap(rules, model, layout, variant, options)
+        if not km:
+            raise RuntimeError("cannot build an xkb keymap")
+        old = self.keymap
+        self.keymap = km
+        self.layout_index = index
+        lock = self.xkb.keymap_mod_get_index(km, b"Lock")
+        self.locked_mods = (1 << lock) if caps and lock < 32 else 0
+        for d in self.devices.values():
+            if d.keys:
+                d.keys.close()
+                d.keys = self.new_keys()
+        if old:
+            self.xkb.keymap_unref(old)
+        debug("keymap", layout, variant, options, "index", index)
+
+    def new_keys(self):
+        return KeyState(self.xkb, self.keymap, self.layout_index, self.locked_mods)
+
+    def set_layout_index(self, index):
+        self.layout_index = index
+        for d in self.devices.values():
+            if d.keys:
+                d.keys.set_layout(index)
+
+    # devices
+    def rescan(self):
+        self.last_rescan = time.monotonic()
+        self.scanned = True
+        try:
+            names = [n for n in os.listdir(self.input_dir) if n.startswith("event")]
+        except OSError:
+            names = []
+        present = {os.path.join(self.input_dir, n) for n in names}
+        for path in list(self.devices):
+            if path not in present:
+                self.drop(path)
+        self.denied &= present
+        self.ignored &= present
+        for n in names:
+            path = os.path.join(self.input_dir, n)
+            if path in self.devices or path in self.ignored:
+                continue
+            kind = classify(n, self.sysfs)
+            if not kind:
+                self.ignored.add(path)
+                continue
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+            except PermissionError:
+                self.denied.add(path)
+                continue
+            except OSError:
+                continue
+            self.denied.discard(path)
+            dev = Device(path, kind, fd)
+            if kind == "keyboard":
+                dev.keys = self.new_keys()
+            self.devices[path] = dev
+            self.sel.register(dev, selectors.EVENT_READ, "device")
+            debug("watching", kind, path)
+        self.report()
+
+    def drop(self, path):
+        dev = self.devices.pop(path, None)
+        if not dev:
+            return
+        try:
+            self.sel.unregister(dev)
+        except (KeyError, ValueError):
+            pass
+        if dev.keys:
+            dev.keys.close()
+        try:
+            os.close(dev.fd)
+        except OSError:
+            pass
+
+    def read_device(self, dev):
+        try:
+            data = os.read(dev.fd, INPUT_EVENT.size * 64)
+        except BlockingIOError:
+            return
+        except OSError as e:
+            if e.errno in (errno.ENODEV, errno.EIO, errno.EBADF):
+                self.drop(dev.path)
+                self.report()
+            return
+        data = dev.buf + data
+        whole = len(data) - len(data) % INPUT_EVENT.size
+        dev.buf = data[whole:]
+        for _s, _us, etype, code, value in INPUT_EVENT.iter_unpack(data[:whole]):
+            if etype == EV_KEY:
+                self.on_key(dev, code, value)
+            elif etype == EV_SYN and code == SYN_DROPPED:
+                self.typed.reset()
+                dev.held.clear()
+                if dev.keys:
+                    dev.keys.close()
+                    dev.keys = self.new_keys()
+
+    def on_key(self, dev, code, value):
+        if value == 1:
+            dev.held.add(code)
+        elif value == 0:
+            dev.held.discard(code)
+        if 0x100 <= code < 0x160:
+            if value == 1 and code in POINTER_BUTTONS:
+                self.typed.reset()  # a click can put the caret anywhere
+            return
+        if not dev.keys:
+            return
+        keycode = code + 8
+        if value == 0:
+            dev.keys.update(keycode, False)
+            return
+        if value == 2:
+            # A held key. Apps repeat on their own clock (Hyprland's repeat_rate),
+            # not the kernel's, so how many characters it produced is unknowable.
+            self.typed.reset()
+            return
+        if self.paused or not self.matcher.table:
+            dev.keys.update(keycode, True)
+            self.typed.reset()
+            return
+        result = dev.keys.press(keycode)
+        dev.keys.update(keycode, True)
+        kind = result[0]
+        if kind == "text":
+            self.typed.add(result[1])
+            hit = self.matcher.match(self.typed.text)
+            if hit:
+                self.typed.reset()
+                keyword, text, dynamic = hit
+                if dynamic:
+                    # The shell resolves {date}, {cursor}, ... and answers
+                    # with a "type" command.
+                    self.emit(event="expand", keyword=keyword)
+                    return
+                delay = DEFAULT_DELAY_MS
+                self.pending = (time.monotonic() + delay / 1000, time.monotonic(), keyword, text)
+        elif kind == "backspace":
+            self.typed.backspace()
+        elif kind == "reset":
+            self.typed.reset()
+
+    def flush_pending(self):
+        if not self.pending:
+            return
+        _due, started, keyword, text = self.pending
+        self.pending = None
+        self.type_plan(key_plan(len(keyword), text))
+        debug("expanded a keyword %.1f ms after its last key" % ((time.monotonic() - started) * 1000))
+
+    def type_plan(self, keys):
+        for attempt in (0, 1):
+            if self.injector is None:
+                self.connect_injector()
+                if self.injector is None:
+                    return
+            try:
+                held = set()
+                for d in self.devices.values():
+                    held |= d.held
+                self.injector.type_keys(keys, avoid=held)
+                break
+            except (OSError, WaylandError) as e:
+                debug("typing failed:", e)
+                self.disconnect_injector()
+
+    def connect_injector(self):
+        self.injector, self.injector_kind = make_injector(self.xkb)
+        if isinstance(self.injector, VirtualKeyboard):
+            self.sel.register(self.injector, selectors.EVENT_READ, "wayland")
+        self.report()
+
+    def disconnect_injector(self):
+        if self.injector is None:
+            return
+        if isinstance(self.injector, VirtualKeyboard):
+            try:
+                self.sel.unregister(self.injector)
+            except (KeyError, ValueError):
+                pass
+        try:
+            self.injector.close()
+        except OSError:
+            pass
+        self.injector, self.injector_kind = None, None
+
+    # Hyprland events: focus changes reset the typed text, layout switches
+    # follow the layout.
+    def connect_hyprland(self):
+        self.hypr = hyprland_events_socket()
+        self.hypr_buf = b""
+        if self.hypr:
+            self.sel.register(self.hypr, selectors.EVENT_READ, "hyprland")
+
+    def read_hyprland(self):
+        try:
+            data = self.hypr.recv(65536)
+        except BlockingIOError:
+            return
+        except OSError:
+            data = b""
+        if not data:
+            self.sel.unregister(self.hypr)
+            self.hypr.close()
+            self.hypr = None
+            return
+        self.hypr_buf += data
+        *lines, self.hypr_buf = self.hypr_buf.split(b"\n")
+        for line in lines:
+            name, _, arg = line.decode("utf-8", "replace").partition(">>")
+            # A new focused window is a new text field. Layers (notifications,
+            # the bar) are not: a toast arriving mid-keyword must not break it.
+            if name in ("activewindowv2", "activewindow"):
+                self.typed.reset()
+            elif name == "activelayout":
+                self.set_layout_index(active_layout_index(arg.split(",", 1)[0]))
+            elif name == "configreloaded":
+                self.load_keymap()
+
+    # shell commands on stdin, one per line: pause, resume, rescan, or JSON
+    #   {"cmd": "snippets", "list": [{keyword, text, dynamic}]}
+    #   {"cmd": "type", "backspaces": n, "text": "...", "left": k}
+    def read_stdin(self):
+        try:
+            data = os.read(sys.stdin.fileno(), 1 << 20)
+        except BlockingIOError:
+            return
+        except OSError:
+            data = b""
+        if not data:
+            # The shell went away; so do we.
+            self.running = False
+            return
+        *lines, self.stdin_buf = (self.stdin_buf + data).split(b"\n")
+        for raw in lines:
+            self.command(raw.decode("utf-8", "replace").strip())
+        self.report()
+
+    def command(self, line):
+        if line == "pause":
+            self.paused = True
+            self.typed.reset()
+        elif line == "resume":
+            self.paused = False
+            self.typed.reset()
+        elif line == "rescan":
+            self.ignored.clear()
+            self.rescan()
+        elif line.startswith("{"):
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                return
+            if not isinstance(msg, dict):
+                return
+            if msg.get("cmd") == "snippets":
+                self.set_table(msg.get("list"))
+            elif msg.get("cmd") == "type":
+                n, text, left = msg.get("backspaces"), msg.get("text"), msg.get("left", 0)
+                if not isinstance(n, int) or not isinstance(text, str) or not isinstance(left, int):
+                    return
+                n = max(0, min(n, MAX_KEYWORD))
+                left = max(0, min(left, len(text)))
+                self.type_plan(key_plan(n, text[:MAX_TEXT], left))
+
+    def run(self):
+        self.load_keymap()
+        self.connect_injector()
+        self.connect_hyprland()
+        # Commands arrive on stdin when the shell started us through a pipe, and
+        # the pipe closing means the shell is gone. A terminal or /dev/null is
+        # left alone so `omacast-expander run` works by hand.
+        try:
+            stdin_is_pipe = stat.S_ISFIFO(os.fstat(sys.stdin.fileno()).st_mode)
+        except (OSError, ValueError):
+            stdin_is_pipe = False
+        if self.use_stdin and stdin_is_pipe:
+            os.set_blocking(sys.stdin.fileno(), False)
+            self.sel.register(sys.stdin.fileno(), selectors.EVENT_READ, "stdin")
+        self.rescan()
+        while self.running:
+            now = time.monotonic()
+            timeout = self.RESCAN_SECONDS
+            if self.pending:
+                timeout = max(0.0, self.pending[0] - now)
+            events = self.sel.select(timeout)
+            # stdin first: a snippet saved a moment ago must already apply to
+            # the key that woke us.
+            events.sort(key=lambda e: e[0].data != "stdin")
+            for key, _ in events:
+                tag = key.data
+                if tag == "device":
+                    self.read_device(key.fileobj)
+                elif tag == "wayland":
+                    try:
+                        self.injector.drain()
+                    except (OSError, WaylandError) as e:
+                        debug("wayland:", e)
+                        self.disconnect_injector()
+                        self.report()
+                elif tag == "hyprland":
+                    self.read_hyprland()
+                elif tag == "stdin":
+                    self.read_stdin()
+            now = time.monotonic()
+            if self.pending and now >= self.pending[0]:
+                self.flush_pending()
+            if now - self.last_rescan >= self.RESCAN_SECONDS:
+                self.rescan()
+                if self.hypr is None:
+                    self.connect_hyprland()
+                if self.injector is None:
+                    self.connect_injector()
+        self.disconnect_injector()
+
+
+# ------------------------------------------------------------------------- CLI
+
+
+def device_access():
+    keyboards, readable = 0, 0
+    try:
+        names = [n for n in os.listdir("/dev/input") if n.startswith("event")]
+    except OSError:
+        names = []
+    for n in names:
+        if classify(n) == "keyboard":
+            keyboards += 1
+            if os.access(os.path.join("/dev/input", n), os.R_OK):
+                readable += 1
+    return keyboards, readable
+
+
+def cmd_status(_args):
+    keyboards, readable = device_access()
+    try:
+        vk = VirtualKeyboard(Xkb())
+        vk.close()
+        injector = "virtual-keyboard"
+    except (OSError, WaylandError, RuntimeError) as e:
+        injector = "wtype" if shutil.which("wtype") else "none: %s" % e
+    print(json.dumps({
+        "keyboards": keyboards, "readable": readable, "injector": injector,
+        "udevRule": os.path.exists(UDEV_RULE_PATH), "version": VERSION,
+    }, indent=2))
+    return 0 if readable and not injector.startswith("none") else 1
+
+
+SETUP_SCRIPT = (
+    'printf "%s" "$1" > "$2" && chmod 0644 "$2" && udevadm control --reload-rules'
+    ' && udevadm trigger --subsystem-match=input --action=change && udevadm settle --timeout=5'
+)
+UNSETUP_SCRIPT = (
+    'rm -f "$2" && udevadm control --reload-rules'
+    ' && udevadm trigger --subsystem-match=input --action=change'
+)
+
+
+def run_as_root(script, gui):
+    """Root runs /bin/sh with a fixed script and the rule as an argument, never
+    a file from the plugin folder, which is yours to write to."""
+    if os.geteuid() == 0:
+        runner = []
+    elif gui or not sys.stdin.isatty():
+        runner = ["pkexec"]
+    else:
+        runner = ["sudo"]
+    return subprocess.run(runner + ["/bin/sh", "-c", script, "sh", UDEV_RULE, UDEV_RULE_PATH], check=False).returncode
+
+
+def cmd_setup(args):
+    """Install the udev rule that lets the logged-in user read keyboards."""
+    r = run_as_root(SETUP_SCRIPT, "--gui" in args)
+    if r == 0:
+        print("Keyboard access granted (%s). omacast picks it up within a couple of seconds." % UDEV_RULE_PATH)
+    return r
+
+
+def cmd_unsetup(args):
+    return run_as_root(UNSETUP_SCRIPT, "--gui" in args)
+
+
+def cmd_type(_args):
+    """Type stdin the way an expansion would (for testing and benchmarks)."""
+    text = sys.stdin.read()
+    xkb = Xkb()
+    injector, kind = make_injector(xkb)
+    if not injector:
+        print("omacast-expander: no way to type on this compositor", file=sys.stderr)
+        return 1
+    t = time.monotonic()
+    injector.type_keys(key_plan(0, text))
+    debug("typed %d chars with %s in %.1f ms" % (len(text), kind, (time.monotonic() - t) * 1000))
+    injector.close()
+    return 0
+
+
+def cmd_run(args):
+    daemon = Daemon(
+        input_dir=os.environ.get("OMACAST_EXPANDER_INPUT_DIR", "/dev/input"),
+        sysfs=os.environ.get("OMACAST_EXPANDER_SYSFS", "/sys/class/input"),
+    )
+    try:
+        daemon.run()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+USAGE = """\
+omacast-expander %s: keyword expansion for omacast's Snippets
+
+usage: omacast-expander COMMAND [ARGS]
+
+  run                     the expander (omacast's shell plugin starts it and
+                          sends the keyword table on stdin)
+  status                  keyboard access and typing backend, as JSON
+  setup [--gui]           grant your user read access to keyboards (udev rule, needs root)
+  unsetup                 remove that rule again
+  type                    type stdin the way an expansion would
+""" % VERSION
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE, end="")
+        return 0
+    if argv[0] in ("-v", "--version"):
+        print(VERSION)
+        return 0
+    commands = {"run": cmd_run, "status": cmd_status, "setup": cmd_setup, "unsetup": cmd_unsetup, "type": cmd_type}
+    fn = commands.get(argv[0])
+    if not fn:
+        print("omacast-expander: unknown command %r\n" % argv[0], file=sys.stderr)
+        print(USAGE, end="", file=sys.stderr)
+        return 2
+    return fn(argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
