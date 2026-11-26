@@ -73,6 +73,22 @@ var emojiMigrations = [
   }
 ]
 
+// Snippets (SPEC §6.4 snippets, §8.3): Snippets.normalizeSnippet records,
+// in creation order.
+var snippetsMigrations = [
+  {
+    version: 1,
+    name: "snippets",
+    up: function(doc) {
+      doc.snippets = []         // {id, name, text, keyword, pinned, createdAt, updatedAt, usedAt, useCount}
+      // Keyword expansion (SPEC §5.4) reads keyboards, so it's opt-in: the
+      // "Enable Keyword Expansion" action in Search Snippets turns it on. [D]
+      doc.expansion = false
+      return doc
+    }
+  }
+]
+
 var SEARCH_HISTORY_LIMIT = 20
 
 function pushSearchHistory(history, query) {
@@ -89,7 +105,8 @@ var documents = {
   frecency: { file: "frecency.json", migrations: frecencyMigrations },
   calculator: { file: "calculator.json", migrations: calculatorMigrations },
   emoji: { file: "emoji.json", migrations: emojiMigrations },
-  clipboard: { file: "clipboard.json", migrations: clipboardMigrations }
+  clipboard: { file: "clipboard.json", migrations: clipboardMigrations },
+  snippets: { file: "snippets.json", migrations: snippetsMigrations }
 }
 
 var configDefaults = {
@@ -153,6 +170,7 @@ if (typeof module !== "undefined") {
     calculatorMigrations: calculatorMigrations,
     clipboardMigrations: clipboardMigrations,
     emojiMigrations: emojiMigrations,
+    snippetsMigrations: snippetsMigrations,
     pushSearchHistory: pushSearchHistory,
     SEARCH_HISTORY_LIMIT: SEARCH_HISTORY_LIMIT,
     documents: documents,
