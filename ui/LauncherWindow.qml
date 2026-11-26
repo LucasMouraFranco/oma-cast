@@ -127,8 +127,11 @@ PanelWindow {
   // Clipboard History's type dropdown (ref 04 App. A: All/Text/Images/…).
   property string clipboardFilter: "all"
   readonly property bool clipboardView: window.view.kind === "clipboard"
+  readonly property bool snippetsView: window.view.kind === "snippets"
+  // Create / Edit Snippet: a form whose fields own the keyboard.
+  readonly property bool formView: window.view.kind === "snippet-form"
   // List on the left, DetailPane on the right.
-  readonly property bool splitView: window.clipboardView || window.view.kind === "theme"
+  readonly property bool splitView: window.clipboardView || window.snippetsView || window.view.kind === "theme"
   // The dropdown: Clipboard History's types, or the root's (config rootFilter).
   readonly property bool hasFilter: window.clipboardView || (window.atRoot && window.backend.config.rootFilter)
   readonly property var filterOptions: window.clipboardView ? ClipboardHistory.FILTERS : RootSearch.FILTERS
@@ -160,6 +163,8 @@ PanelWindow {
     : window.view.kind === "calculator-history" ? "Search calculations…"
     : window.clipboardView ? "Type to filter entries…"
     : window.view.kind === "theme" ? "Search themes…"
+    : window.snippetsView ? "Search snippets…"
+    : window.formView ? window.view.title
     : window.grid ? "Search Emoji & Symbols…"
     : "Search for apps and commands…"
 
@@ -174,7 +179,8 @@ PanelWindow {
   readonly property var clipboardDetail: {
     window.clipboardRevision
     if (!window.splitView || !window.selectedRow) return null
-    var r = window.backend.callSync(window.clipboardView ? "clipboard.getDetail" : "themes.getDetail", { id: window.selectedRow.itemId })
+    var method = window.clipboardView ? "clipboard.getDetail" : window.snippetsView ? "snippets.getDetail" : "themes.getDetail"
+    var r = window.backend.callSync(method, { id: window.selectedRow.itemId })
     return r.ok ? r.data : null
   }
 
@@ -296,6 +302,8 @@ PanelWindow {
     if (next.kind === "clipboard") window.clipboardFilter = "all"
     window.query = next.kind === "alias" ? (next.value || "") : ""
     window.rebuild(true)
+    // A command that leads into a view with news (Import Snippets) says so there.
+    if (next.toast) window.showToast("success", next.toast)
   }
 
   function pop() {
@@ -323,7 +331,7 @@ PanelWindow {
     pointerGate.reset()
     var keepId = !resetSelection && window.selectedRow ? window.selectedRow.itemId : ""
     window.searchPending = false
-    if (window.view.kind === "alias") { Rows.update(rows, []); window.select(-1); return }
+    if (window.view.kind === "alias" || window.formView) { Rows.update(rows, []); window.select(-1); return }
     window.searchPending = true
     var revision = window.backend.candidatesRevision
     window.backend.searchAsync({ query: window.query, view: window.view, filter: window.activeFilter }, function(result) {
@@ -776,6 +784,9 @@ PanelWindow {
       return true
     }
     if (key === Qt.Key_Escape) { window.handleEscape(shift); return true }
+    // The form's fields own the keyboard; a key that reached the search
+    // field instead (after a click on the card) sends the focus back.
+    if (window.formView) { if (formLoader.item) formLoader.item.focusFirst(); return true }
     if (ctrl && (key === Qt.Key_Plus || key === Qt.Key_Equal)) { window.setZoom(window.zoom + 0.1); return true }
     if (ctrl && key === Qt.Key_Minus) { window.setZoom(window.zoom - 0.1); return true }
     if (ctrl && key === Qt.Key_0) { window.setZoom(1); return true }
@@ -835,6 +846,8 @@ PanelWindow {
       }
       if (window.grid && !ctrl && !alt && (key === Qt.Key_Left || key === Qt.Key_Right)) { window.moveColumn(key === Qt.Key_Left ? -1 : 1); return true }
       if (ctrl && shift && key === Qt.Key_P) { window.performIfOffered(["pin", "unpin"]); return true }
+      if (ctrl && !shift && key === Qt.Key_E) { window.performIfOffered(["edit"]); return true }
+      if (ctrl && shift && key === Qt.Key_N && window.snippetsView) { window.request({ id: "snippet:", action: "create" }); return true }
       if (ctrl && !shift && key === Qt.Key_O) { window.performIfOffered(["open-link"]); return true }
       if (key === Qt.Key_PageUp) { window.move(-8); return true }
       if (key === Qt.Key_PageDown) { window.move(8); return true }
@@ -870,7 +883,7 @@ PanelWindow {
     function onCalculatorRevisionChanged() { if (window.shown && !window.actionPanelOpen && window.query) window.rebuild(false) }
     // A copy, pin or delete: refresh an open Clipboard History.
     function onNotification(method) {
-      if (method !== "clipboard.stateChanged" && method !== "themes.changed") return
+      if (method !== "clipboard.stateChanged" && method !== "themes.changed" && method !== "snippets.stateChanged") return
       window.clipboardRevision++
       if (window.shown && window.splitView && !window.actionPanelOpen && !window.alert) window.rebuild(false)
     }
@@ -893,7 +906,7 @@ PanelWindow {
     borderSpec: window.borderSpec
     clip: true
 
-    MouseArea { anchors.fill: parent; onClicked: { window.closePopups(); keyCatcher.forceActiveFocus() } }
+    MouseArea { anchors.fill: parent; onClicked: { window.closePopups(); if (window.formView && formLoader.item) formLoader.item.focusFirst(); else keyCatcher.forceActiveFocus() } }
 
     // A TextInput rather than a plain Item so input-method commits (fcitx5,
     // dictation apps) reach the launcher; key presses still go to handleKey
@@ -965,7 +978,7 @@ PanelWindow {
         anchors.verticalCenter: parent.verticalCenter
         text: window.query || (pills.visible ? "" : window.placeholder)
         color: window.look.foreground
-        opacity: window.query ? 1 : 0.45
+        opacity: window.query || window.formView ? 1 : 0.45
         font.family: window.look.fontFamily
         font.pixelSize: Math.round(Style.font.heading * 1.15 * window.zoom)
         elide: Text.ElideLeft
@@ -977,7 +990,7 @@ PanelWindow {
         anchors.verticalCenter: parent.verticalCenter
         x: queryText.x + (window.query ? Math.min(queryText.contentWidth, queryText.width) + Style.space(1) : 0)
         color: window.look.accent
-        visible: window.shown && !window.actionPanelOpen && window.argFocus < 0
+        visible: window.shown && !window.actionPanelOpen && window.argFocus < 0 && !window.formView
 
         SequentialAnimation on opacity {
           running: window.shown
@@ -1132,7 +1145,7 @@ PanelWindow {
         width: window.splitView ? Math.round(parent.width * 0.4) : parent.width
         anchors.topMargin: window.px(4)
         anchors.bottomMargin: window.px(4)
-        visible: window.view.kind !== "alias"
+        visible: window.view.kind !== "alias" && !window.formView
         clip: true
         model: rows
         reuseItems: true
@@ -1166,10 +1179,29 @@ PanelWindow {
         zoom: window.zoom
       }
 
+      Loader {
+        id: formLoader
+        anchors.fill: parent
+        active: window.formView
+        sourceComponent: SnippetForm {
+          backend: window.backend
+          look: window.look
+          zoom: window.zoom
+          snippetId: window.view.snippetId || ""
+          onSaved: function(message) {
+            window.pop()
+            keyCatcher.forceActiveFocus()
+            window.showToast("success", message)
+          }
+          onCancelled: { window.pop(); keyCatcher.forceActiveFocus() }
+          onFailed: function(message) { window.showToast("failure", message) }
+        }
+      }
+
       Column {
         anchors.centerIn: parent
         spacing: window.px(8)
-        visible: window.view.kind === "alias" || rows.count === 0
+        visible: !window.formView && (window.view.kind === "alias" || rows.count === 0)
 
         Logo {
           anchors.horizontalCenter: parent.horizontalCenter
@@ -1191,6 +1223,7 @@ PanelWindow {
           text: window.view.kind === "alias" ? window.view.title
             : window.view.kind === "calculator-history" && !window.query ? "No Calculations Yet"
             : window.clipboardView && !window.query && window.clipboardFilter === "all" ? "No Clipboard Entries"
+            : window.snippetsView && !window.query ? "No Snippets Yet"
             : (window.backend.ready ? "No results" : "Loading…")
           color: window.look.foreground
           font.family: window.look.fontFamily
@@ -1201,6 +1234,7 @@ PanelWindow {
           textFormat: Text.PlainText
           text: window.view.kind === "alias" ? "Typing the alias exactly in the root search puts this command on top. Leave it empty to remove it."
             : window.view.kind === "calculator-history" && !window.query ? "Type a calculation in the root search, then copy or paste the answer."
+            : window.snippetsView && !window.query ? "Press Ctrl+Shift+N to create one, or run “Import Snippets from Shorthand”."
             : window.clipboardView && !window.query && window.clipboardFilter === "all"
               ? (window.backend.config.clipboardHistory ? "Copy something and it shows up here." : "Recording is off: clipboardHistory is false in config.json.") : ""
           visible: text.length > 0
@@ -1285,6 +1319,7 @@ PanelWindow {
           window.selectedRow
           window.backend.storeRevision
           if (window.view.kind === "alias") return { title: "Save Alias", shortcut: "↵" }
+          if (window.formView) return { title: window.view.snippetId ? "Save Snippet" : "Create Snippet", shortcut: "Ctrl ↵" }
           var list = window.actionsForSelected()
           return list.length ? list[0] : null
         }
@@ -1306,19 +1341,19 @@ PanelWindow {
         KeyHint {
           visible: footerActions.primary !== null
           anchors.verticalCenter: parent.verticalCenter
-          keys: "↵"
+          keys: window.formView ? "Ctrl ↵" : "↵"
           color: window.look.foreground
           zoom: window.zoom
         }
         Rectangle {
-          visible: window.view.kind !== "alias"
+          visible: window.view.kind !== "alias" && !window.formView
           anchors.verticalCenter: parent.verticalCenter
           width: 1
           height: window.px(14)
           color: Util.alpha(window.look.foreground, 0.2)
         }
         Text {
-          visible: window.view.kind !== "alias"
+          visible: window.view.kind !== "alias" && !window.formView
           anchors.verticalCenter: parent.verticalCenter
           textFormat: Text.PlainText
           text: "Actions"
@@ -1328,7 +1363,7 @@ PanelWindow {
           font.pixelSize: Math.round(Style.font.bodySmall * window.zoom)
         }
         KeyHint {
-          visible: window.view.kind !== "alias"
+          visible: window.view.kind !== "alias" && !window.formView
           anchors.verticalCenter: parent.verticalCenter
           keys: window.actionPanelKeys
           color: window.look.foreground

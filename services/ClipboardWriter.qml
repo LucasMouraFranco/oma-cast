@@ -13,6 +13,8 @@ Item {
 
   function copy(text, mime) { writer.send({ text: String(text), mime: mime || "", paste: false }) }
   function paste(text, mime) { writer.send({ text: String(text), mime: mime || "", paste: true }) }
+  // A snippet with {cursor}: paste, then press Left this many times.
+  function pasteAt(text, left) { writer.send({ text: String(text), mime: "", paste: true, left: left > 0 ? Math.floor(left) : 0 }) }
   // A file of ours (a Clipboard History image or long text): its path and
   // MIME type are on the command line, never its contents.
   function copyFile(path, mime, paste) { writer.send({ file: String(path), mime: String(mime), paste: !!paste }) }
@@ -20,13 +22,14 @@ Item {
   function send(item) {
     if (proc.running) { writer.queued = item; return }
     proc.text = item.file ? "" : item.text
-    proc.command = ["bash", "-lc", item.paste ? writer.pasteScript : writer.copyScript, "omacast-copy", item.mime || "", item.file || ""]
+    proc.command = ["bash", "-lc", item.paste ? writer.pasteScript : writer.copyScript, "omacast-copy", item.mime || "", item.file || "", String(item.left || 0)]
     proc.stdinEnabled = !item.file
     proc.running = true
   }
 
   // Constant scripts: no caller text ever reaches the command line. $1 is a
-  // MIME type, $2 a file to copy instead of stdin.
+  // MIME type, $2 a file to copy instead of stdin, $3 how many Left presses
+  // follow the paste (a snippet's {cursor}).
   readonly property string copyScript: 'if [[ $2 ]]; then exec wl-copy ${1:+--type "$1"} <"$2"; else exec wl-copy ${1:+--type "$1"}; fi'
   // Wait for the launcher to unmap, as omarchy-clipboard-paste-text does.
   // Terminals take Ctrl+Shift+V (SPEC §5.3): most map Shift+Insert to the
@@ -37,7 +40,12 @@ case ${class,,} in
   *alacritty*|*kitty*|foot|footclient|*wezterm*|*ghostty*|*konsole*|*gnome-terminal*|*gnome.terminal*|*ptyxis*|*herdr*)
     wtype -M ctrl -M shift -k v -m shift -m ctrl 2>/dev/null || true ;;
   *) wtype -M shift -k Insert -m shift 2>/dev/null || true ;;
-esac'
+esac
+if [[ $3 =~ ^[0-9]+$ ]] && (( $3 > 0 && $3 <= 20000 )); then
+  sleep 0.05
+  keys=(); for ((i = 0; i < $3; i++)); do keys+=(-k Left); done
+  wtype "${keys[@]}" 2>/dev/null || true
+fi'
 
   Process {
     id: proc
