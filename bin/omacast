@@ -38,11 +38,18 @@ Launcher
   run <commandId>        Open a command directly
   call <method> [json]   Call a backend method, e.g. omacast call system.info
 
+Snippets
+  snippets import [file] Import a Raycast snippets export or a Shorthand snippets.json
+                         (default: ~/.config/shorthand/snippets.json)
+  snippets expansion on|off
+                         Turn keyword expansion on or off
+
 Setup
   install                Enable the plugin and link this CLI into ~/.local/bin
                          (a development checkout is also linked into omarchy-shell)
   uninstall              Disable and remove the plugin, offering to remove the hotkey
   setup hyprland [--yes] Bind Alt+Space to the launcher in ~/.config/hypr/omacast.lua
+  setup snippets         Let keyword expansion read keyboards (a udev rule; asks for root)
   build-search           Build the optional flea-search helper (needs Rust/cargo)
   doctor                 Check that the pieces are in place
 
@@ -299,6 +306,55 @@ plugin_errors() {
         END { for (i = 0; i < n; i++) print errs[i] }'
 }
 
+# Imports by path: the file's contents never reach a command line.
+cmd_snippets() {
+  need_shell
+  case "${1:-}" in
+    import)
+      local file=${2:-${XDG_CONFIG_HOME:-$HOME/.config}/shorthand/snippets.json}
+      [[ -r $file ]] || die "cannot read $file"
+      file=$(realpath -- "$file")
+      ipc call snippets.import "$(jq -cn --arg path "$file" '{path: $path}')"
+      echo
+      ;;
+    expansion)
+      case "${2:-}" in
+        on|off) ipc call snippets.setExpansion "$(jq -cn --argjson on "$([[ $2 == on ]] && echo true || echo false)" '{enabled: $on}')"; echo ;;
+        *) die "usage: omacast snippets expansion on|off" ;;
+      esac
+      ;;
+    *) die "usage: omacast snippets import [file] | omacast snippets expansion on|off" ;;
+  esac
+}
+
+# Snippet keyword expansion (SPEC §5.4): opt-in, and only one expander at a time.
+doctor_snippets() {
+  local status enabled state
+  status=$(omarchy-shell "$IPC_TARGET" call snippets.expansionStatus '' 2>/dev/null) || return 0
+  enabled=$(jq -r '.data.enabled // false' <<<"$status" 2>/dev/null)
+  state=$(jq -r '.data.state // ""' <<<"$status" 2>/dev/null)
+  if [[ $enabled != true ]]; then
+    printf '  info  snippet keyword expansion is off (Search Snippets > Actions > Enable Keyword Expansion)\n'
+    return 0
+  fi
+  case $state in
+    running) printf '  ok    snippet keyword expansion is running\n' ;;
+    no-access) printf '  FAIL  keyword expansion cannot read your keyboards; run: omacast setup snippets\n'; bad=1 ;;
+    no-injector) printf '  FAIL  keyword expansion cannot type into this compositor (no virtual keyboard, no wtype)\n'; bad=1 ;;
+    no-keyboards) printf '  info  keyword expansion found no keyboards\n' ;;
+    *) printf '  info  keyword expansion is %s\n' "${state:-starting}" ;;
+  esac
+  # Two expanders would both replace the same keyword.
+  if pgrep -x espanso >/dev/null 2>&1 || pgrep -f '/bin/shorthand run$' >/dev/null 2>&1; then
+    printf '  FAIL  another text expander (espanso or Shorthand) is running too; stop one of them\n'
+    bad=1
+  fi
+}
+
+cmd_setup_snippets() {
+  python3 "$repo/bin/omacast-expander" setup "$@"
+}
+
 cmd_doctor() {
   local bad=0
   check() {
@@ -333,6 +389,7 @@ cmd_doctor() {
       printf '  ok    no QML errors in the shell log\n'
     fi
   fi
+  doctor_snippets
   if [[ -x $repo/bin/omacast-search ]]; then
     printf '  ok    flea-search helper is built\n'
   else
@@ -367,9 +424,11 @@ case "${1:-}" in
   setup)
     case "${2:-}" in
       hyprland) cmd_setup_hyprland "${3:-}" ;;
-      *) die "usage: omacast setup hyprland [--yes]" ;;
+      snippets) cmd_setup_snippets "${@:3}" ;;
+      *) die "usage: omacast setup hyprland [--yes] | omacast setup snippets" ;;
     esac
     ;;
+  snippets) cmd_snippets "${2:-}" "${3:-}" ;;
   doctor) cmd_doctor ;;
   -h|--help|help|"") usage ;;
   *) usage >&2; exit 1 ;;

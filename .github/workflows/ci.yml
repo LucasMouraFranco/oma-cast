@@ -22,6 +22,13 @@ jobs:
       - name: Unit tests
         run: node --test tests/*.test.js
 
+      # bin/omacast-expander: Python standard library plus libxkbcommon (the
+      # keymap tests skip themselves without it).
+      - name: Expander unit tests
+        run: |
+          sudo apt-get install -y --no-install-recommends libxkbcommon0 >/dev/null
+          python3 -I -m unittest discover -s tests -p expander_test.py
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Search helper
@@ -35,6 +42,7 @@ jobs:
           for script in bin/omacast bin/build-search tests/smoke.sh tests/native-transport.sh; do
             bash -n "$script"
           done
+          python3 -I -m py_compile bin/omacast-expander tests/e2e_nested.py
 
       - name: Plugin manifest is valid JSON
         run: node -e 'JSON.parse(require("fs").readFileSync("manifest.json", "utf8"))'

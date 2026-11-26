@@ -9,3 +9,4 @@ site/public/demo/core.js
 site/public/demo/emoji.json
 # wrangler's local state from deploys and dry runs
 site/.wrangler/
+__pycache__/
