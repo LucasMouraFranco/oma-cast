@@ -61,6 +61,33 @@ var BUILTINS = [
     rootSearch: { when: "always" }
   },
   {
+    id: "builtin:search-snippets",
+    title: "Search Snippets",
+    subtitle: "Snippets",
+    glyph: "\uf0c5",                     // nf-fa-files_o
+    keywords: ["snippets", "snippet", "text", "expansion", "expander", "shorthand", "keyword", "template"],
+    run: { push: { kind: "snippets", title: "Search Snippets" } },
+    rootSearch: { when: "always" }
+  },
+  {
+    id: "builtin:create-snippet",
+    title: "Create Snippet",
+    subtitle: "Snippets",
+    glyph: "\uf067",                     // nf-fa-plus
+    keywords: ["snippet", "snippets", "new", "add", "text", "expansion", "keyword"],
+    run: { push: { kind: "snippet-form", title: "Create Snippet", snippetId: "" } },
+    rootSearch: { when: "always" }
+  },
+  {
+    id: "builtin:import-shorthand-snippets",
+    title: "Import Snippets from Shorthand",
+    subtitle: "Snippets",
+    glyph: "\uf019",                     // nf-fa-download
+    keywords: ["snippets", "import", "shorthand", "espanso", "migrate"],
+    run: { importShorthand: true },
+    rootSearch: { when: "always" }
+  },
+  {
     id: "builtin:calculator-history",
     title: "Calculator History",
     subtitle: "Calculator",

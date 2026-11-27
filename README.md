@@ -19,7 +19,8 @@ Omarchy's built-in menu is great at what it does. omacast adds what Raycast user
 
 * **Learns your habits.** Results are ranked with a port of Raycast's root-search algorithm, plus frecency and learned search terms. The things you actually use float to the top, and if you type `ff` and pick Firefox, `ff` keeps meaning Firefox.
 * **One search for everything.** Your apps, all ~400 Omarchy menu actions (with breadcrumbs and live ✓ state), a calculator, and web-search fallbacks.
-* **Built-in commands.** Clipboard History, Emoji & Symbols, Switch Theme and Calculator History, each with an optional hotkey of its own.
+* **Built-in commands.** Clipboard History, Snippets, Emoji & Symbols, Switch Theme and Calculator History, each with an optional hotkey of its own.
+* **Snippets that expand anywhere.** Type a keyword such as `;sig` in any app and it turns into your text, with `{date}`, `{clipboard}` and `{cursor}` placeholders.
 * **Finds the window you already have.** `↵` on an app focuses its open window instead of starting another one.
 * **Your shortcuts.** Give anything an alias, pin favorites, and hide the commands you never touch.
 * **Keyboard-first.** A Ctrl+K action panel, Ctrl+1–9 quick picks, search history on ↑, section jumping, and emacs- or vim-style navigation.
@@ -161,6 +162,48 @@ Pressing the binding again closes it.
 - Copies from password managers are never recorded: anything marked sensitive, plus the apps in `"clipboardDisabledApplications"` (Wayland app ids; KeePassXC, Bitwarden, 1Password and Seahorse by default). `"clipboardHistory": false` stops recording.
 - The history is in `~/.local/share/omacast/db/clipboard.json`, and images and long text are in `~/.local/share/omacast/clipboard/`, both readable only by you.
 
+## Snippets
+
+Search **Search Snippets**, or bind it directly:
+
+```lua
+o.bind("ALT + SHIFT + SPACE", "omacast snippets", hl.dsp.global("omacast:snippets"), { submap_universal = true })
+```
+
+- **Search Snippets** lists your snippets with a preview and details beside them. `↵` pastes into the app
+  you came from, `Ctrl+↵` copies, `Ctrl+E` edits, `Ctrl+Shift+N` creates one, `Ctrl+Shift+P` pins and `Ctrl+D`
+  deletes. Duplicate is in the action panel (`Ctrl+K`).
+- **Create Snippet** is a form with a name, the text (any length, several lines) and an optional keyword.
+  `Tab` moves between fields and `Ctrl+↵` saves. It warns you when a keyword is taken, and when it can never
+  fire because a shorter keyword hides inside it (`lm` inside `lmail`).
+- **Placeholders** fill in when the snippet is pasted or expanded: `{cursor}` (where the caret ends up),
+  `{clipboard}` (`offset=1` for the copy before), `{date}`, `{time}`, `{datetime}`, `{day}` (with
+  `format="yyyy-MM-dd"` and `offset="+1d -2h"`) and `{uuid}`. Modifiers follow a `|`: `uppercase`,
+  `lowercase`, `trim`, `percent-encode`, `json-stringify`. `{argument}` and nested snippets aren't supported yet.
+- **Import** a Raycast snippets export, or the snippets of the
+  [Shorthand](https://github.com/LucasMouraFranco/omarchy-shorthand) plugin, with
+  `omacast snippets import [file]`. When `~/.config/shorthand/snippets.json` exists, the
+  **Import Snippets from Shorthand** command does the same from the launcher. Importing again skips what's
+  already there.
+
+### Keyword expansion
+
+Typing a snippet's keyword anywhere replaces it with the snippet the moment its last key lands, mid-word too
+(`me@@w` → `me@work.example`). The longest keyword wins. It's **off until you turn it on**, because it has to
+read your keyboards:
+
+1. Open Search Snippets, press `Ctrl+K` and choose **Enable Keyword Expansion** (or run
+   `omacast snippets expansion on`).
+2. If omacast can't read your keyboards yet, it asks for your password once to add a udev rule,
+   `/etc/udev/rules.d/70-omacast.rules`, that gives the logged-in user read access to keyboards and mice
+   (`omacast setup snippets` does the same from a terminal).
+
+`bin/omacast-expander` does the work. It needs Python 3 and libxkbcommon, both part of Omarchy. It reads key
+presses without grabbing them, so every key still reaches Hyprland. It turns them into characters with your
+own layout, keeps only the last few in memory, and logs none of them. It types the replacement through the
+Wayland virtual keyboard, so nothing touches your clipboard. Expansion pauses while omacast is open. Only run
+one text expander: `omacast doctor` warns when espanso or Shorthand is running too.
+
 ## Emoji & Symbols
 
 Search **Search Emoji & Symbols**, or bind it directly:
@@ -289,17 +332,21 @@ omacast run <commandId>         # e.g. builtin:emoji-picker, app:com.mitchellh.g
 omacast call <method> [json]    # call any backend method; omacast call system.info lists them
 omacast doctor                  # checks the shell, IPC, the backend, QML errors in the shell log, and the hotkey
 omacast setup hyprland [--yes]
+omacast setup snippets          # let keyword expansion read keyboards (udev rule, asks for root)
+omacast snippets import [file]  # a Raycast export or a Shorthand snippets.json
+omacast snippets expansion on|off
 omacast build-search            # build the optional search helper (needs cargo)
 omacast install | uninstall
 ```
 
-Global shortcuts for Hyprland binds: `omacast:toggle`, `omacast:clipboard`, `omacast:emoji`, `omacast:theme`.
+Global shortcuts for Hyprland binds: `omacast:toggle`, `omacast:clipboard`, `omacast:snippets`, `omacast:emoji`, `omacast:theme`.
 Bind them with `submap_universal = true` so they still work while omacast is open.
 
 ### Dependencies and network access
 
 omacast needs only what Omarchy ships: `omarchy-shell` (Quickshell), Hyprland, bash, `jq` and `socat`.
-It adds no packages and no background services.
+It adds no packages and no background services. Keyword expansion, when you turn it on, also uses Python 3
+and libxkbcommon, which Omarchy ships.
 
 - **Superwhisper recording indicator.** When `python3` with PyGObject is installed, the
   plugin runs `services/superwhisper-frame.py` alongside the shell. While the launcher is open it tells
@@ -320,12 +367,14 @@ It adds no packages and no background services.
 
 ### Privacy
 
-Your search history, learned search terms, calculator history and clipboard history stay on your machine, in
+Your search history, learned search terms, calculator history, clipboard history and snippets stay on your machine, in
 owner-only files: omacast creates its `~/.config`, `~/.local/share`, `~/.cache` and `~/.local/state`
 directories as `0700` and its database files as `0600`, and tightens any it finds readable by other users.
 Text you copy or paste goes to `wl-copy` on stdin, never on a command line, so other local users can't read it
 from the process list. Paste sends Ctrl+Shift+V to terminals (Alacritty, Kitty, Ghostty, foot, WezTerm,
 Konsole, GNOME Terminal, Ptyxis, Herdr) and Shift+Insert everywhere else, as Omarchy's clipboard history does.
+Snippet text reaches the keyword expander on stdin too. The expander keeps only the last few typed characters, in
+memory, and never logs them.
 The one exception is a script command's arguments: they reach your script as `$1`…`$3`, so they are on its
 command line while it runs.
 
@@ -349,6 +398,7 @@ Done:
 - [x] Emoji & Symbols
 - [x] Switch Theme
 - [x] Script Commands (arguments, confirmation)
+- [x] Snippets and keyword expansion
 
 Next:
 
@@ -359,7 +409,7 @@ Next:
 Later:
 
 - [ ] Quicklinks
-- [ ] Snippets and text expansion
+- [ ] Snippets: `{argument}` forms, nested snippets and the "after a delimiter" expansion modes
 - [ ] Running Raycast extensions built from the open-source [`raycast/extensions`](https://github.com/raycast/extensions) repo
 - [ ] Window management and a window switcher
 - [ ] File search

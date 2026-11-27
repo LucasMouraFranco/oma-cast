@@ -17,6 +17,8 @@ import "core/ClipboardHistory.js" as ClipboardHistory
 import "core/Themes.js" as Themes
 import "core/Emoji.js" as Emoji
 import "core/ScriptCommands.js" as ScriptCommands
+import "core/Snippets.js" as Snippets
+import "core/Placeholders.js" as Placeholders
 import "services"
 
 Item {
@@ -31,7 +33,7 @@ Item {
 
   property var config: Schema.withConfigDefaults(null)
   property bool directoriesReady: false
-  readonly property bool ready: directoriesReady && settingsStore.loaded && frecencyStore.loaded && calculatorStore.loaded && emojiStore.loaded
+  readonly property bool ready: directoriesReady && settingsStore.loaded && frecencyStore.loaded && calculatorStore.loaded && emojiStore.loaded && snippetStore.loaded
 
   readonly property var registry: Rpc.createRegistry()
   readonly property double startedAt: Date.now()
@@ -117,6 +119,8 @@ Item {
     // A built-in that replaces an Omarchy command hides that command.
     var superseded = ({})
     RootSearch.BUILTINS.forEach(function(d) { (d.supersedes || []).forEach(function(id) { superseded[id] = true }) })
+    // "Import Snippets from Shorthand" only where there is something to import.
+    if (!backend.shorthandPresent) superseded["builtin:import-shorthand-snippets"] = true
     next = next.filter(function(c) { return !superseded[c.id] })
     for (var s = 0; s < scriptSource.commands.length; s++) next.push(ScriptCommands.candidate(scriptSource.commands[s]))
     var byId = ({})
@@ -422,6 +426,146 @@ Item {
     return themeSource.themes.filter(function(t) { return t.slug === slug })[0] || null
   }
 
+  // --------------------------------------------------------------- snippets
+
+  function snippetList() { return snippetStore.loaded ? snippetStore.doc.snippets : [] }
+
+  function snippetEntry(id) {
+    var s = Snippets.find(backend.snippetList(), id)
+    if (!s) throw new Error("No such snippet")
+    return s
+  }
+
+  function updateSnippets(mutate) {
+    if (!snippetStore.loaded) throw new Error("Snippets are not loaded")
+    if (snippetStore.readOnly) throw new Error("snippets.json is read-only: " + (snippetStore.lastError || "written by a newer build"))
+    snippetStore.update(function(doc) { doc.snippets = mutate(doc.snippets) })
+    backend.emit("snippets.stateChanged", null)
+  }
+
+  function newSnippetId() { return Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36) }
+
+  readonly property bool snippetExpansion: snippetStore.loaded && snippetStore.doc.expansion === true
+
+  // The expander's table: every keyword, with the text of the static ones.
+  function expansionTable() {
+    return Snippets.expansionTable(backend.snippetList(), function(text) { return Placeholders.needs(text).dynamic })
+  }
+
+  // {clipboard offset=N}: the Nth text in Clipboard History, newest first.
+  // Long text kept in a file and images count as entries but give "". [D]
+  function clipboardText(offset) {
+    var list = backend.clipboardEntries()
+    var e = list[offset]
+    return e && e.type === "text" && !e.path ? String(e.text || "") : ""
+  }
+
+  // Resolves a snippet's placeholders, then calls done({text, cursor}).
+  // {clipboard} reads Clipboard History; with history off, offset 0 asks
+  // wl-paste (stdout, no argv) and other offsets are empty.
+  function resolveSnippetText(text, done) {
+    var need = Placeholders.needs(text)
+    var ctx = { now: new Date(), hour12: backend.hour12, clipboard: backend.clipboardText }
+    var history = backend.config.clipboardHistory && clipboardStore.loaded && backend.clipboardEntries().length > 0
+    if (need.clipboard.length && !history) {
+      clipboardReader.read(function(current) {
+        ctx.clipboard = function(offset) { return offset === 0 ? current : "" }
+        done(Placeholders.resolve(text, ctx))
+      })
+      return
+    }
+    done(need.dynamic ? Placeholders.resolve(text, ctx) : { text: text, cursor: -1 })
+  }
+
+  function expansionAction() {
+    if (!backend.snippetExpansion) return { id: "enable-expansion", title: "Enable Keyword Expansion", shortcut: "", section: "expansion", icon: "\uf11c" }
+    if (expander.needsAccess) return { id: "grant-access", title: "Grant Keyboard Access…", shortcut: "", section: "expansion", icon: "\uf084" }
+    return { id: "disable-expansion", title: "Disable Keyword Expansion", shortcut: "", section: "expansion", icon: "\uf11c" }
+  }
+
+  // Kept in snippets.json, not the general settings: it belongs to Snippets. [D]
+  function setSnippetExpansion(on) {
+    if (!snippetStore.loaded) throw new Error("Snippets are not loaded")
+    snippetStore.update(function(doc) { doc.expansion = !!on })
+    backend.emit("snippets.stateChanged", null)
+  }
+
+  function importSnippetsFrom(path) {
+    importFile.path = ""
+    importFile.path = String(path)
+    var text = importFile.text()
+    if (!text) throw new Error("Could not read " + path)
+    var incoming = Snippets.parseImport(text)
+    var result = null
+    backend.updateSnippets(function(list) {
+      result = Snippets.importInto(list, incoming, Date.now(), backend.newSnippetId)
+      return result.snippets
+    })
+    return { added: result.added, skipped: result.skipped, keywordsDropped: result.keywordsDropped }
+  }
+
+  function importSummary(r) {
+    var title = r.added === 1 ? "Imported 1 snippet" : "Imported " + r.added + " snippets"
+    if (r.skipped) title += ", " + r.skipped + " already there"
+    if (r.keywordsDropped) title += ", " + r.keywordsDropped + " without their taken keyword"
+    return title
+  }
+
+  readonly property string shorthandFile: (Quickshell.env("XDG_CONFIG_HOME") || Quickshell.env("HOME") + "/.config") + "/shorthand/snippets.json"
+
+  function snippetAction(action, id, confirmed) {
+    switch (action) {
+      case "create":
+        return { push: { kind: "snippet-form", title: "Create Snippet", snippetId: "" } }
+      case "enable-expansion":
+        backend.setSnippetExpansion(true)
+        if (expander.needsAccess) expander.grantAccess()
+        return { toast: { style: "success", title: expander.needsAccess ? "Asking for keyboard access…" : "Keyword expansion on" } }
+      case "disable-expansion":
+        backend.setSnippetExpansion(false)
+        return { toast: { style: "success", title: "Keyword expansion off" } }
+      case "grant-access":
+        expander.grantAccess()
+        return { toast: { style: "success", title: "Asking for keyboard access…" } }
+    }
+    var s = backend.snippetEntry(id)
+    switch (action) {
+      case "open":
+      case "paste":
+      case "copy":
+        var paste = action !== "copy"
+        backend.resolveSnippetText(s.text, function(r) {
+          if (paste) clipboard.pasteAt(r.text, r.cursor)
+          else clipboard.copy(r.text)
+        })
+        backend.updateSnippets(function(list) { return Snippets.markUsed(list, s.id, Date.now()) })
+        return paste ? { close: true } : { close: true, hud: "Copied to Clipboard" }
+      case "edit":
+        return { push: { kind: "snippet-form", title: "Edit Snippet", snippetId: s.id } }
+      case "duplicate":
+        backend.updateSnippets(function(list) {
+          return Snippets.create(list, { name: Snippets.duplicateName(list, s.name), text: s.text, keyword: "" }, backend.newSnippetId(), Date.now())
+        })
+        return { toast: { style: "success", title: "Snippet duplicated" } }
+      case "pin":
+      case "unpin":
+        backend.updateSnippets(function(list) { return Snippets.setPinned(list, s.id, action === "pin") })
+        return { toast: { style: "success", title: action === "pin" ? "Pinned" : "Unpinned" } }
+      case "delete-entry":
+        if (!confirmed) return { confirm: { title: "Delete Snippet", message: "“" + s.name + "” will be deleted.", primary: "Delete", destructive: true } }
+        backend.updateSnippets(function(list) { return Snippets.remove(list, s.id) })
+        return { toast: { style: "success", title: "Snippet deleted" } }
+    }
+    throw new Error("Unknown action " + action)
+  }
+
+  // A keyword the expander matched that has placeholders: resolve, then type.
+  function expandDynamic(keyword) {
+    var s = backend.snippetList().filter(function(x) { return x.keyword === keyword })[0]
+    if (!s) { expander.typeExpansion(keyword.length, "", -1); return }
+    backend.resolveSnippetText(s.text, function(r) { expander.typeExpansion(keyword.length, r.text, r.cursor) })
+  }
+
   // ------------------------------------------------------------- execution
 
   function summonPlugin(id, payload) {
@@ -512,6 +656,10 @@ Item {
             return { close: true }
           }
           backend.recordVisit(id, query)
+          if (candidate.run.importShorthand) {
+            var imported = backend.importSnippetsFrom(backend.shorthandFile)
+            return { push: { kind: "snippets", title: "Search Snippets", toast: backend.importSummary(imported) } }
+          }
           if (candidate.run.push && candidate.run.push.kind === "theme") themeSource.refresh()
           if (candidate.run.push) return { push: candidate.run.push }
           if (candidate.run.summon) backend.summonPlugin(candidate.run.summon, candidate.run.payload || "{}")
@@ -664,6 +812,7 @@ Item {
         if (view && view.kind === "menu") sections = RootSearch.submenuSections(backend.candidates, view.menuId, query, ctx, backend.deps)
         else if (view && view.kind === "theme")
           sections = Themes.sections(themeSource.themes, themeSource.current, query)
+        else if (view && view.kind === "snippets") sections = Snippets.sections(backend.snippetList(), query)
         else if (view && view.kind === "clipboard") sections = ClipboardHistory.sections(backend.clipboardEntries(), query, String(data && data.filter || "all"), ctx.nowMs)
         else if (view && view.kind === "emoji") sections = Emoji.sections(backend.emoji.list, query, Object.assign(backend.emojiState(), { fleaHits: data.fleaHits || null }))
         else if (view && view.kind === "calculator-history") sections = RootSearch.historySections(calculatorStore.doc.history, query, ctx.nowMs, Calculator.filterHistory)
@@ -693,6 +842,10 @@ Item {
           return ClipboardHistory.actionsFor(clip, app ? app.name : "")
         }
         if (rowId.indexOf("emoji:") === 0) return Emoji.actionsFor(backend.emojiCandidate(rowId).candidate, backend.emojiState().tone)
+        if (rowId.indexOf("snippet:") === 0) {
+          var shownApp = backend.activeApp()
+          return Snippets.actionsFor(backend.snippetEntry(rowId), shownApp ? shownApp.name : "", backend.expansionAction())
+        }
         var candidate = backend.decorated(rowId)
         if (!candidate) {
           var fallback = RootSearch.FALLBACKS.filter(function(f) { return f.id === data.id })[0]
@@ -716,6 +869,7 @@ Item {
           var clip = backend.clipboardEntry(rowId)
           return clip ? ClipboardHistory.detail(clip).info : []
         }
+        if (rowId.indexOf("snippet:") === 0) return Snippets.detail(backend.snippetEntry(rowId), backend.snippetList(), nowMs).info
         if (rowId.indexOf("emoji:") === 0) {
           var found = backend.emojiCandidate(rowId)
           return Emoji.aboutFor(found.candidate, found.entry)
@@ -737,6 +891,8 @@ Item {
         }
         if (data && String(data.id).indexOf("clipboard:") === 0)
           return backend.clipboardAction(String(data.action || "open"), data.id, !!data.confirmed)
+        if (data && String(data.id).indexOf("snippet:") === 0)
+          return backend.snippetAction(String(data.action || "open"), data.id, !!data.confirmed)
         // Destructive commands come back as a confirmation unless confirmed.
         if (!(data && data.confirmed)) {
           var confirm = RootSearch.confirmationFor(String(data && data.id || ""), String(data && data.action || "open"))
@@ -827,6 +983,57 @@ Item {
       deleteAll: function() { return backend.clipboardAction("delete-all-entries", "", true) }
     })
 
+    // Names from Raycast's snippets namespace (ref 02 §5.2); validate,
+    // getDetail and the expansion calls stand in for its UI state [D].
+    Rpc.register(backend.registry, "snippets", {
+      getAll: function() { return backend.snippetList() },
+      get: function(data) { return backend.snippetEntry(String(data && data.id || "")) },
+      getDetail: function(data) {
+        var s = Snippets.find(backend.snippetList(), String(data && data.id || ""))
+        return s ? Snippets.detail(s, backend.snippetList(), Date.now()) : null
+      },
+      validate: function(data) {
+        var id = String(data && data.id || "")
+        var f = Snippets.fields(data)
+        return { problem: Snippets.problem(backend.snippetList(), f, id), shadowedBy: Snippets.shadowedBy(backend.snippetList(), f.keyword, id) }
+      },
+      isKeywordAvailable: function(data) {
+        var f = Snippets.fields({ keyword: data && data.keyword })
+        return !backend.snippetList().some(function(s) { return s.keyword === f.keyword && s.id !== String(data && data.id || "") }) && Snippets.validKeyword(f.keyword)
+      },
+      create: function(data) {
+        var problem = Snippets.problem(backend.snippetList(), data, "")
+        if (problem) throw new Error(problem)
+        var id = backend.newSnippetId()
+        backend.updateSnippets(function(list) { return Snippets.create(list, data, id, Date.now()) })
+        return backend.snippetEntry(id)
+      },
+      update: function(data) {
+        var s = backend.snippetEntry(String(data && data.id || ""))
+        var problem = Snippets.problem(backend.snippetList(), data, s.id)
+        if (problem) throw new Error(problem)
+        backend.updateSnippets(function(list) { return Snippets.update(list, s.id, data, Date.now()) })
+        return backend.snippetEntry(s.id)
+      },
+      "delete": function(data) { return backend.snippetAction("delete-entry", String(data && data.id || ""), true) },
+      pin: function(data) { return backend.snippetAction("pin", String(data && data.id || ""), true) },
+      unpin: function(data) { return backend.snippetAction("unpin", String(data && data.id || ""), true) },
+      paste: function(data) { return backend.snippetAction("paste", String(data && data.id || ""), true) },
+      copy: function(data) { return backend.snippetAction("copy", String(data && data.id || ""), true) },
+      // A path, never the file's contents: argv is readable by other users.
+      "import": function(data) {
+        var r = backend.importSnippetsFrom(String(data && data.path || backend.shorthandFile))
+        backend.emit("snippets.imported", r)
+        return r
+      },
+      setEditing: function(data) { expander.setPausedBy("editor", !!(data && data.editing)); return null },
+      expansionStatus: function() {
+        return { enabled: backend.snippetExpansion, state: expander.state, keyboards: expander.keyboards, injector: expander.injector,
+          keywords: backend.expansionTable().length, paused: expander.paused, pausedBy: Object.keys(expander.pausers) }
+      },
+      setExpansion: function(data) { backend.setSnippetExpansion(!!(data && data.enabled)); return backend.snippetExpansion }
+    })
+
     Rpc.register(backend.registry, "themes", {
       getAll: function() { return { current: themeSource.current, themes: themeSource.themes } },
       getDetail: function(data) {
@@ -863,8 +1070,10 @@ Item {
     function onValuesChanged() { rebuildTimer.restart() }
   }
 
-  Component.onDestruction: { settingsStore.flush(); frecencyStore.flush(); calculatorStore.flush(); emojiStore.flush(); clipboardStore.flush() }
+  Component.onDestruction: { settingsStore.flush(); frecencyStore.flush(); calculatorStore.flush(); emojiStore.flush(); clipboardStore.flush(); snippetStore.flush() }
   onNotification: function(method, data) {
+    // Typing a keyword into omacast's own search must not expand it there.
+    if (method === "window.visibilityChanged" && data) expander.setPausedBy("launcher", !!data.visible)
     if (method === "window.visibilityChanged" && data && data.visible) {
       menuSource.refresh()
       scriptSource.refresh()
@@ -917,7 +1126,7 @@ Item {
     id: mkdirs
     // Moves directories left under the old name, then creates everything
     // owner-only and repairs modes left readable by older builds.
-    command: Paths.setupArgv(backend.paths, [Schema.documents.settings.file, Schema.documents.frecency.file, Schema.documents.calculator.file, Schema.documents.emoji.file, Schema.documents.clipboard.file]
+    command: Paths.setupArgv(backend.paths, [Schema.documents.settings.file, Schema.documents.frecency.file, Schema.documents.calculator.file, Schema.documents.emoji.file, Schema.documents.clipboard.file, Schema.documents.snippets.file]
       .map(function(file) { return backend.paths.db + "/" + file }))
     onExited: function(exitCode) {
       if (exitCode !== 0) backend.log("error", "paths", "could not create data directories", { exitCode: exitCode })
@@ -986,6 +1195,43 @@ Item {
     onLoadedChanged: if (loaded) backend.pruneClipboard()
   }
 
+  JsonStore {
+    id: snippetStore
+    ready: backend.directoriesReady
+    path: backend.paths.db + "/" + Schema.documents.snippets.file
+    migrations: Schema.documents.snippets.migrations
+    onMessage: function(level, text, metadata) { backend.log(level, "store", text, metadata) }
+    onLoadedChanged: if (loaded) expander.pushTable()
+  }
+
+  property bool shorthandPresent: false
+  onShorthandPresentChanged: rebuildTimer.restart()
+  FileView {
+    path: backend.shorthandFile
+    printErrors: false
+    onLoaded: backend.shorthandPresent = true
+    onLoadFailed: backend.shorthandPresent = false
+  }
+
+  // Snippets > Import: read in place, synchronously (a small local file).
+  FileView {
+    id: importFile
+    blockLoading: true
+    printErrors: false
+  }
+
+  // {clipboard} with Clipboard History off: the current text selection.
+  ClipboardReader { id: clipboardReader }
+
+  // Keyword expansion (SPEC §5.4), only while snippetExpansion is on.
+  SnippetExpander {
+    id: expander
+    enabled: backend.snippetExpansion && snippetStore.loaded
+    table: function() { return backend.expansionTable() }
+    onExpandRequested: function(keyword) { backend.expandDynamic(keyword) }
+    onMessage: function(level, text, metadata) { backend.log(level, "snippets", text, metadata) }
+  }
+
   CalculatorData {
     id: calculatorData
     cacheDir: backend.directoriesReady ? backend.paths.cache : ""
@@ -999,6 +1245,7 @@ Item {
   Connections { target: frecencyStore; function onChanged() { backend.storeRevision++ } }
   Connections { target: calculatorStore; function onChanged() { backend.storeRevision++ } }
   Connections { target: emojiStore; function onChanged() { backend.storeRevision++ } }
+  Connections { target: snippetStore; function onChanged() { backend.storeRevision++; expander.pushTable() } }
 
   FileView {
     path: backend.directoriesReady ? backend.paths.configFile : ""

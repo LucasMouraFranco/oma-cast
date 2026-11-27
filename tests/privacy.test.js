@@ -21,7 +21,7 @@ function tempHome(t) {
 function runSetup(home) {
   const p = Paths.resolve((name) => ({ HOME: home, XDG_RUNTIME_DIR: home + "/run" })[name] || "")
   fs.mkdirSync(home + "/run", { mode: 0o755 })
-  const files = ["settings.json", "frecency.json", "calculator.json"].map((f) => p.db + "/" + f)
+  const files = ["settings.json", "frecency.json", "calculator.json", "snippets.json"].map((f) => p.db + "/" + f)
   const [cmd, ...args] = Paths.setupArgv(p, files)
   const r = spawnSync("bash", ["-c", "umask 022; exec \"$@\"", "umask-022", cmd, ...args], { encoding: "utf8" })
   assert.equal(r.status, 0, r.stderr)
@@ -32,7 +32,7 @@ test("first start under umask 022 creates owner-only dirs and 0600 store files",
   const p = runSetup(tempHome(t))
   for (const dir of Paths.privateRoots(p)) assert.equal(mode(dir), 0o700, dir)
   for (const dir of Paths.directoriesToCreate(p)) assert.equal(mode(dir), 0o700, dir)
-  for (const f of ["settings.json", "frecency.json", "calculator.json"]) assert.equal(mode(p.db + "/" + f), 0o600, f)
+  for (const f of ["settings.json", "frecency.json", "calculator.json", "snippets.json"]) assert.equal(mode(p.db + "/" + f), 0o600, f)
 })
 
 test("an atomic save into a pre-created file keeps it private", (t) => {
@@ -132,11 +132,40 @@ function runClipboardScript(t, kind, windowClass) {
 for (const kind of ["copy", "paste"]) {
   test(`calculator ${kind} keeps the text out of every command line`, (t) => {
     runClipboardScript(t, kind, "")
-    // $1 is a MIME type and $2 a file in our clipboard dir (ClipboardWriter.send);
-    // $@, $*, $3… would mean more of the caller's data on the command line.
-    assert.doesNotMatch(clipboardScripts()[kind], /\$\{?([03-9@*#])/, "the script reads only $1 and $2")
+    // $1 is a MIME type, $2 a file in our clipboard dir and $3 a Left-press
+    // count for a snippet's {cursor} (ClipboardWriter.send); $@, $*, $4… would
+    // mean more of the caller's data on the command line.
+    const script = clipboardScripts()[kind]
+    assert.doesNotMatch(script, /\$\{?([04-9@*#])/, "the script reads only $1, $2 and $3")
+    // $3 is only ever used after it is checked to be a plain number.
+    const uses = script.split("$3").length - 1
+    if (uses) assert.match(script, /if \[\[ \$3 =~ \^\[0-9\]\+\$ \]\]/, "$3 is validated as a number")
   })
 }
+
+test("a snippet paste with {cursor} moves the caret left, and nothing else", (t) => {
+  const home = tempHome(t)
+  const log = home + "/cmdlines"
+  const fake = '#!/bin/bash\ntr "\\0" " " </proc/$$/cmdline >>"$LOG"; echo >>"$LOG"\n'
+  fs.writeFileSync(home + "/wl-copy", fake + 'cat >"$LOG.clipboard"\n', { mode: 0o755 })
+  fs.writeFileSync(home + "/wtype", fake, { mode: 0o755 })
+  fs.writeFileSync(home + "/sleep", "#!/bin/bash\nexit 0\n", { mode: 0o755 })
+  fs.writeFileSync(home + "/hyprctl", "#!/bin/bash\necho '{}'\n", { mode: 0o755 })
+  const run = (count) => {
+    fs.rmSync(log, { force: true })
+    const r = spawnSync("bash", ["-c", clipboardScripts().paste, "omacast-copy", "", "", count], {
+      input: "Hi ! private", encoding: "utf8", env: { ...process.env, LOG: log, PATH: home + ":" + process.env.PATH }
+    })
+    assert.equal(r.status, 0, r.stderr)
+    return fs.readFileSync(log, "utf8")
+  }
+  const lines = run("2").trim().split("\n")
+  assert.equal(lines.length, 3)
+  assert.match(lines[2], /\/wtype -k Left -k Left\s*$/)
+  assert.ok(!lines.join("\n").includes("private"))
+  // Anything but a plain count presses nothing.
+  for (const bad of ["0", "-1", "2; touch x", "$(id)", "99999"]) assert.equal(run(bad).trim().split("\n").length, 2, bad)
+})
 
 // SPEC §5.3: terminals (and Herdr) paste with Ctrl+Shift+V; everything else
 // keeps Shift+Insert, the keystroke omarchy-clipboard-paste-text sends.

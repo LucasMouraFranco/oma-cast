@@ -291,6 +291,14 @@ On macOS this runs in the host and is fed by `snippets.register({snippetIds, key
 
 Security note [D]: an evdev reader is technically a keylogger. Make it opt-in, keep it in-process with no logging of the buffer, and explain this in onboarding.
 
+**As built (2026-11-26) [D].** The evdev reader is `bin/omacast-expander`, a Python helper (standard library and libxkbcommon through ctypes) ported from the Shorthand plugin. Like `services/superwhisper-frame.py` it is a child of the shell, not a native module. Differences from the plan above:
+- Access is a uaccess udev rule (`/etc/udev/rules.d/70-omacast.rules`, installed through pkexec), not the `input` group.
+- The shell pushes the keyword table on stdin (`{"cmd":"snippets","list":[{keyword,text,dynamic}]}`); snippet text never reaches an argv or a file of the helper's.
+- Replacements are typed through the Wayland virtual-keyboard protocol (`zwp_virtual_keyboard_v1`), each character on its real US key position, not pasted through the clipboard, so nothing needs restoring. `wtype` (text on stdin) is the fallback.
+- A snippet with placeholders comes back to the shell as `{"event":"expand","keyword":…}`; `core/Placeholders.js` resolves it and the shell answers `{"cmd":"type","backspaces":n,"text":…,"left":k}`, where `left` puts the caret at `{cursor}`.
+- Only `Immediately` mode, and keywords expand within words (Shorthand's and espanso's behaviour). No password-field or per-app exclusions yet. The expander pauses while the launcher is open.
+- The on/off switch lives in `db/snippets.json` (`expansion`), off by default.
+
 ### 5.5 Other host services
 - Notifications use `notify-rust`; action clicks → `systemNotifications.notificationClicked`.
 - Autostart via `~/.config/autostart/<app>.desktop`, or `systemd --user` `<app>.service`.

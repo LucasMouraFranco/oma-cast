@@ -126,6 +126,14 @@ Item {
     onPressed: root.toggleView("builtin:clipboard-history", "clipboard")
   }
 
+  // Toggles Search Snippets directly: hl.dsp.global("omacast:snippets").
+  GlobalShortcut {
+    appid: "omacast"
+    name: "snippets"
+    description: "Toggle omacast Search Snippets"
+    onPressed: root.toggleView("builtin:search-snippets", "snippets")
+  }
+
   // Opens Emoji & Symbols directly: hl.dsp.global("omacast:emoji").
   GlobalShortcut {
     appid: "omacast"
