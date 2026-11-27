@@ -8,8 +8,10 @@ on:
 
 jobs:
   test:
-    # WarpBuild's 2-vCPU Ubuntu runner.
-    runs-on: warp-ubuntu-latest-x64-2x
+    # WarpBuild's 2-vCPU Ubuntu runner on typecraft-dev; forks have no
+    # WarpBuild runners (the job would queue until it's cancelled), so they
+    # use GitHub's.
+    runs-on: ${{ github.repository_owner == 'typecraft-dev' && 'warp-ubuntu-latest-x64-2x' || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@v4
 
