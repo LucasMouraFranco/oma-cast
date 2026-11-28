@@ -109,6 +109,10 @@ PanelWindow {
   property var stack: [{ kind: "root", title: "omacast", query: "" }]
   readonly property var view: window.stack[window.stack.length - 1]
   property string query: ""
+  // Ctrl+A selects the whole query [D]: the search field draws its own text,
+  // so there is no native selection. Any edit or other key drops it.
+  property bool querySelected: false
+  onQueryChanged: window.querySelected = false
   property int selectedIndex: -1
   property var selectedRow: null
   property int searchSerial: 0
@@ -245,6 +249,7 @@ PanelWindow {
   // A reload or disable while shown would otherwise leave Hyprland in the submap.
   Component.onDestruction: if (window.shown) Hyprland.dispatch('hl.dsp.submap("reset")')
   onShownChanged: {
+    window.querySelected = false
     // The "omacast" submap (omacast.lua) lets Super+J/K past Hyprland's binds.
     Hyprland.dispatch('hl.dsp.submap("' + (window.shown ? "omacast" : "reset") + '")')
     if (window.shown) {
@@ -685,6 +690,11 @@ PanelWindow {
   function insertText(text) {
     text = String(text).replace(/[\r\n\u2028\u2029]+/g, " ")
     if (!text) return
+    if (window.querySelected && !window.actionPanelOpen && window.argFocus < 0) {
+      if (window.view.kind === "alias") text = text.replace(/\s/g, "")
+      window.setQuery(text)
+      return
+    }
     if (window.actionPanelOpen) actionPanel.item.filter += text
     else if (window.argFocus >= 0) {
       if (window.argDefs[window.argFocus].type === "dropdown") return
@@ -771,12 +781,36 @@ PanelWindow {
     return true
   }
 
+  // Keys while the whole query is selected: typing replaces it, Backspace or
+  // Delete clears it, Ctrl+C / Ctrl+X copy / cut it. Anything else drops the
+  // selection and is handled as usual (returns false).
+  function handleSelectedQueryKey(event, ctrl, shift, alt) {
+    var key = event.key
+    if (key === Qt.Key_Shift || key === Qt.Key_Control || key === Qt.Key_Alt || key === Qt.Key_Meta || key === Qt.Key_Super_L || key === Qt.Key_Super_R) return false
+    if (ctrl && !shift && !alt && (key === Qt.Key_C || key === Qt.Key_X)) {
+      clipboardInput.text = window.query
+      clipboardInput.selectAll()
+      clipboardInput.copy()
+      clipboardInput.clear()
+      if (key === Qt.Key_X) window.setQuery("")
+      return true
+    }
+    if (ctrl && !shift && !alt && key === Qt.Key_A) return true
+    if ((key === Qt.Key_Backspace || key === Qt.Key_Delete) && !alt) { window.setQuery(""); return true }
+    if (window.isTyping(event) && !(window.view.kind === "alias" && key === Qt.Key_Space)) { window.setQuery(event.text); return true }
+    window.querySelected = false
+    return false
+  }
+
   function handleKey(event) {
     var ctrl = (event.modifiers & Qt.ControlModifier) !== 0
     var shift = (event.modifiers & Qt.ShiftModifier) !== 0
     var alt = (event.modifiers & Qt.AltModifier) !== 0
     var key = event.key
     var enter = key === Qt.Key_Return || key === Qt.Key_Enter
+    if (window.querySelected && !window.alert && !window.formView && !window.aboutOpen && !window.dropdownOpen
+        && !window.toastPanelOpen && !window.actionPanelOpen && window.argFocus < 0
+        && window.handleSelectedQueryKey(event, ctrl, shift, alt)) return true
 
     if (window.alert) {
       if (key === Qt.Key_Escape) window.alert = null
@@ -815,6 +849,9 @@ PanelWindow {
       if (window.isActionPanelKey(ctrl, alt, shift, key)) { window.actionPanelOpen = false; return true }
       return window.handlePopupKey(event, actionPanel.item, ctrl, alt)
     }
+
+    // Ctrl+A selects the query (Raycast's select-all in the search field).
+    if (ctrl && !shift && !alt && key === Qt.Key_A && window.argFocus < 0) { window.querySelected = window.query !== ""; return true }
 
     if (window.view.kind === "alias") {
       if (enter) { window.saveAlias(); return true }
@@ -982,6 +1019,17 @@ PanelWindow {
         font.family: window.look.fontFamily
         font.pixelSize: Math.round(Style.font.heading * 1.15 * window.zoom)
         elide: Text.ElideLeft
+
+        Rectangle {
+          z: -1
+          visible: window.querySelected && window.query !== ""
+          anchors.verticalCenter: parent.verticalCenter
+          width: Math.min(queryText.contentWidth, queryText.width)
+          height: queryText.font.pixelSize + Style.space(4)
+          color: window.look.accent
+          opacity: 0.35
+          radius: Style.space(1)
+        }
       }
 
       Rectangle {
@@ -990,7 +1038,7 @@ PanelWindow {
         anchors.verticalCenter: parent.verticalCenter
         x: queryText.x + (window.query ? Math.min(queryText.contentWidth, queryText.width) + Style.space(1) : 0)
         color: window.look.accent
-        visible: window.shown && !window.actionPanelOpen && window.argFocus < 0 && !window.formView
+        visible: window.shown && !window.actionPanelOpen && window.argFocus < 0 && !window.formView && !window.querySelected
 
         SequentialAnimation on opacity {
           running: window.shown
