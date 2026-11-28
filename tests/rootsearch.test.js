@@ -138,6 +138,21 @@ test("hotkeys: own beats outside, and the actions follow", () => {
   ])
 })
 
+test("hotkeys: a menu command's Hyprland bind shows, removes and yields to its own", () => {
+  const K = require("../core/Keybindings.js")
+  const withK = Object.assign({ Keybindings: K }, deps)
+  const lock = candidates().find((c) => c.id === "omarchy:system.lock")
+  const bound = Object.assign({}, lock, { hotkey: "Super Ctrl L", hotkeyBind: "SUPER + CTRL + L" })
+  let row = RS.decorate(bound, ctx(), withK)
+  assert.equal(row.hotkey, "Super Ctrl L")
+  assert.equal(row.externalHotkey, "Super Ctrl L")
+  assert.ok(RS.actionsFor(row).some((a) => a.id === "remove-hotkey"))
+
+  row = RS.decorate(bound, ctx({ commands: { [lock.id]: { hotkey: "SUPER + ALT + L", removedBinds: ["SUPER + CTRL + L"] } } }), withK)
+  assert.equal(row.hotkey, "Super Alt L")
+  assert.ok(RS.actionsFor(row).some((a) => a.id === "restore-hotkey"))
+})
+
 test("actions: primary first, favourites and alias offered", () => {
   const app = RS.decorate(RS.appCandidate(apps[0]), ctx(), deps)
   const ids = RS.actionsFor(app).map((a) => a.id)

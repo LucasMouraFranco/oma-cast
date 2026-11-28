@@ -121,7 +121,14 @@ Item {
       if (chord) { app.hotkey = Keybindings.formatChord(chord); app.hotkeyBind = Keybindings.bindString(chord) }
       next.push(app)
     }
-    next = next.concat(RootSearch.menuCandidates(menuSource.tree, menuSource.guards, menuSource.providerItems, backend.deps))
+    var menu = RootSearch.menuCandidates(menuSource.tree, menuSource.guards, menuSource.providerItems, backend.deps)
+    // The same for Omarchy menu commands whose action is the bind's command.
+    var commandHotkeys = Keybindings.commandHotkeys(keybindingSource.records, menu)
+    for (var m = 0; m < menu.length; m++) {
+      var menuChord = commandHotkeys[menu[m].id]
+      if (menuChord) { menu[m].hotkey = Keybindings.formatChord(menuChord); menu[m].hotkeyBind = Keybindings.bindString(menuChord) }
+    }
+    next = next.concat(menu)
     for (var b = 0; b < RootSearch.BUILTINS.length; b++) next.push(RootSearch.builtinCandidate(RootSearch.BUILTINS[b]))
     // A built-in that replaces an Omarchy command hides that command.
     var superseded = ({})

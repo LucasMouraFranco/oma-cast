@@ -183,3 +183,39 @@ test("conflicts name another command's hotkey or a Hyprland bind", () => {
   assert.deepEqual(K.hotkeyConflict("SHIFT + SUPER + RETURN", "app:files", commands, records, {}), { kind: "hyprland", title: "Browser" })
   assert.equal(K.hotkeyConflict("SUPER + CTRL + F12", "app:files", commands, records, {}), null)
 })
+
+test("an exec bind marks the Omarchy menu command that runs the same command", () => {
+  const records = K.parseRecords([
+    "SUPER CTRL + P                      → Proofread\texec\tomarchy-shell shell summon lucasmourafranco.proofread '{}'",
+    "SUPER SHIFT + RETURN                → Browser\texec\tomarchy-launch-browser",
+    "SUPER SHIFT + O                     → Obsidian\texec\tomarchy-launch-or-focus '^obsidian$' 'uwsm-app -- obsidian'",
+    "SUPER + PRINT                       → Color picker\texec\tpkill hyprpicker ||  hyprpicker -a"
+  ].join("\n"))
+  const menu = [
+    // Same command, different quoting and spacing.
+    { id: "omarchy:trigger.proofread", action: 'omarchy-shell  shell summon lucasmourafranco.proofread "{}"' },
+    { id: "omarchy:trigger.capture.color", action: "pkill hyprpicker || hyprpicker -a" },
+    // Opens the browser too, but not the way the bind does.
+    { id: "omarchy:browser.private", action: "omarchy-launch-browser --private" },
+    // The same app as the Obsidian bind, which belongs on the app's row.
+    { id: "omarchy:install.obsidian", action: "uwsm-app -- obsidian" },
+    { id: "omarchy:trigger.other", action: "omarchy-shell shell summon someone.else '{}'" },
+    { id: "omarchy:no-action" }
+  ]
+  const hotkeys = K.commandHotkeys(records, menu)
+  assert.deepEqual(hotkeys, {
+    "omarchy:trigger.proofread": "SUPER CTRL + P",
+    "omarchy:trigger.capture.color": "SUPER + PRINT"
+  })
+  assert.equal(K.formatChord(hotkeys["omarchy:trigger.proofread"]), "Super Ctrl P")
+  assert.equal(K.bindString(hotkeys["omarchy:trigger.proofread"]), "SUPER + CTRL + P")
+})
+
+test("the first bind for a menu command wins, and only exec binds count", () => {
+  const records = K.parseRecords([
+    "SUPER + W                           → Close\tlua\tomarchy-menu",
+    "SUPER + SPACE                       → Menu\texec\tomarchy-menu",
+    "SUPER ALT + SPACE                   → Menu\texec\tomarchy-menu"
+  ].join("\n"))
+  assert.deepEqual(K.commandHotkeys(records, [{ id: "omarchy:menu", action: "omarchy-menu" }]), { "omarchy:menu": "SUPER + SPACE" })
+})

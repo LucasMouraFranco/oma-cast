@@ -199,7 +199,12 @@
       if (hotkeys[app.id]) { c.hotkey = Keybindings.formatChord(hotkeys[app.id]); c.hotkeyBind = Keybindings.bindString(hotkeys[app.id]) }
       return c
     })
-    next = next.concat(RootSearch.menuCandidates(this.data.tree, this.data.guards, this.data.providerItems, deps))
+    var menu = RootSearch.menuCandidates(this.data.tree, this.data.guards, this.data.providerItems, deps)
+    var commandHotkeys = Keybindings.commandHotkeys(records, menu)
+    menu.forEach(function (c) {
+      if (commandHotkeys[c.id]) { c.hotkey = Keybindings.formatChord(commandHotkeys[c.id]); c.hotkeyBind = Keybindings.bindString(commandHotkeys[c.id]) }
+    })
+    next = next.concat(menu)
     RootSearch.BUILTINS.forEach(function (def) { next.push(RootSearch.builtinCandidate(def)) })
     var superseded = {}
     RootSearch.BUILTINS.forEach(function (d) { (d.supersedes || []).forEach(function (id) { superseded[id] = true }) })

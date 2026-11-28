@@ -191,6 +191,39 @@ function appHotkeys(records, entries, defaults) {
   return out
 }
 
+// One spelling for a command line, so a bind and a menu action that run the
+// same thing compare equal however they quote or space it. Lines with shell
+// syntax (pipes, ||, ;) can't be split into words; they compare by their
+// text with runs of whitespace collapsed.
+function commandSignature(command) {
+  var words = splitCommand(command)
+  if (words) return words.length ? "w:" + unwrap(words).join("\u0000") : ""
+  return "s:" + String(command || "").trim().replace(/\s+/g, " ")
+}
+
+// commandId -> chord, for every Omarchy menu command an exec bind runs as
+// is: "omarchy-shell shell summon x '{}'" on Super+Ctrl+P marks the menu row
+// with that action. Only the whole command counts, so a bind that opens an
+// app never lands on a command that merely starts the same program with
+// other arguments. The first bind wins, as in appHotkeys.
+function commandHotkeys(records, candidates) {
+  var bySig = {}
+  for (var i = 0; i < (records || []).length; i++) {
+    var r = records[i]
+    if (r.dispatcher !== "exec" || !r.arg) continue
+    var sig = commandSignature(r.arg)
+    if (sig && !(sig in bySig)) bySig[sig] = r.chord
+  }
+  var out = {}
+  for (var c = 0; c < (candidates || []).length; c++) {
+    var cand = candidates[c]
+    if (!cand || !cand.id || !cand.action) continue
+    var s = commandSignature(cand.action)
+    if (s && s in bySig) out[String(cand.id)] = bySig[s]
+  }
+  return out
+}
+
 // Keycodes (evdev + 8, what Hyprland's code:N means) of the keys whose
 // keysym depends on Shift or the layout. Recorded hotkeys bind these by code,
 // as Omarchy does for its workspace digits, and show them by the US label.
@@ -420,6 +453,8 @@ if (typeof module !== "undefined") {
     commandKeys: commandKeys,
     entryKeys: entryKeys,
     appHotkeys: appHotkeys,
+    commandSignature: commandSignature,
+    commandHotkeys: commandHotkeys,
     formatChord: formatChord,
     parseScan: parseScan,
     splitChord: splitChord,
