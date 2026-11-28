@@ -787,7 +787,9 @@ PanelWindow {
   function handleSelectedQueryKey(event, ctrl, shift, alt) {
     var key = event.key
     if (key === Qt.Key_Shift || key === Qt.Key_Control || key === Qt.Key_Alt || key === Qt.Key_Meta || key === Qt.Key_Super_L || key === Qt.Key_Super_R) return false
-    if (ctrl && !shift && !alt && (key === Qt.Key_C || key === Qt.Key_X)) {
+    // Super+C / Super+X arrive raw under the "omacast" submap (Omarchy's universal copy / cut).
+    var plainCtrl = ctrl && !shift && !alt
+    if ((plainCtrl || window.superOnly(event)) && (key === Qt.Key_C || key === Qt.Key_X)) {
       clipboardInput.text = window.query
       clipboardInput.selectAll()
       clipboardInput.copy()
@@ -795,7 +797,7 @@ PanelWindow {
       if (key === Qt.Key_X) window.setQuery("")
       return true
     }
-    if (ctrl && !shift && !alt && key === Qt.Key_A) return true
+    if ((plainCtrl || window.superOnly(event)) && key === Qt.Key_A) return true
     if ((key === Qt.Key_Backspace || key === Qt.Key_Delete) && !alt) { window.setQuery(""); return true }
     if (window.isTyping(event) && !(window.view.kind === "alias" && key === Qt.Key_Space)) { window.setQuery(event.text); return true }
     window.querySelected = false
@@ -850,8 +852,9 @@ PanelWindow {
       return window.handlePopupKey(event, actionPanel.item, ctrl, alt)
     }
 
-    // Ctrl+A selects the query (Raycast's select-all in the search field).
-    if (ctrl && !shift && !alt && key === Qt.Key_A && window.argFocus < 0) { window.querySelected = window.query !== ""; return true }
+    // Ctrl+A selects the query (Raycast's select-all in the search field). Super+A
+    // too: the "omacast" submap keeps Omarchy's select-all from turning it into Ctrl+A.
+    if (key === Qt.Key_A && ((ctrl && !shift && !alt) || window.superOnly(event)) && window.argFocus < 0) { window.querySelected = window.query !== ""; return true }
 
     if (window.view.kind === "alias") {
       if (enter) { window.saveAlias(); return true }

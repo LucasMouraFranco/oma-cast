@@ -276,6 +276,7 @@ monitor-input-cycle "$1" && echo "Switching display"
 | `Ctrl+T` | Actions for the current toast (Undo, Copy Error Message) |
 | `Ctrl+Shift+K` | About the selected result |
 | `Super+V` / `Ctrl+V` / `Ctrl+Shift+V` / `Shift+Insert` | Paste text into the query (also accepts clipboard-history selections) |
+| `Super+A` / `Ctrl+A` | Select the query (type to replace it; `Super+C` / `Ctrl+C` copy, `Super+X` / `Ctrl+X` cut) |
 | `Super+Backspace` | Clear the query |
 | `Esc` / `Ctrl+[` / `Backspace` on an empty query | Back |
 | `Shift+Esc` | Back to the root |
