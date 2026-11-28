@@ -109,6 +109,13 @@ Item {
     return (DesktopEntries.applications.values || []).filter(function(e) { return !e.noDisplay })
   }
 
+  // A row's Hyprland binds, as keycap labels and in Hyprland's spelling.
+  function setHotkeys(candidate, chords) {
+    if (!chords || !chords.length) return
+    candidate.hotkeys = chords.map(Keybindings.formatChord)
+    candidate.hotkeyBinds = chords.map(Keybindings.bindString)
+  }
+
   function rebuildCandidates() {
     var next = []
     var apps = backend.appEntries()
@@ -117,8 +124,7 @@ Item {
     for (var i = 0; i < apps.length; i++) {
       if (!apps[i] || !apps[i].id) continue
       var app = RootSearch.appCandidate(apps[i])
-      var chord = hotkeys[String(apps[i].id)]
-      if (chord) { app.hotkey = Keybindings.formatChord(chord); app.hotkeyBind = Keybindings.bindString(chord) }
+      backend.setHotkeys(app, hotkeys[String(apps[i].id)])
       next.push(app)
     }
     var commands = RootSearch.menuCandidates(menuSource.tree, menuSource.guards, menuSource.providerItems, backend.deps)
@@ -126,10 +132,7 @@ Item {
     // The same for commands: the bind that runs a menu command, opens a menu
     // or panel, or fires one of omacast's own shortcuts.
     var commandHotkeys = Keybindings.commandHotkeys(keybindingSource.records, commands)
-    for (var m = 0; m < commands.length; m++) {
-      var commandChord = commandHotkeys[commands[m].id]
-      if (commandChord) { commands[m].hotkey = Keybindings.formatChord(commandChord); commands[m].hotkeyBind = Keybindings.bindString(commandChord) }
-    }
+    for (var m = 0; m < commands.length; m++) backend.setHotkeys(commands[m], commandHotkeys[commands[m].id])
     next = next.concat(commands)
     // A built-in that replaces an Omarchy command hides that command.
     var superseded = ({})
@@ -583,6 +586,10 @@ Item {
       throw new Error("Cannot open " + id)
     }
 
+    // "remove-hotkey:<bind>" (RootSearch.actionsFor): one of the row's keys.
+    var removeBind = ""
+    if (action.indexOf("remove-hotkey:") === 0) { removeBind = action.slice("remove-hotkey:".length); action = "remove-hotkey" }
+
     switch (action) {
       case "open-new":
         backend.recordVisit(id, query)
@@ -616,14 +623,16 @@ Item {
       case "set-hotkey":
         return { push: { kind: "hotkey", commandId: id, title: "Hotkey for " + candidate.title, value: candidate.ownHotkey } }
       case "remove-hotkey":
-        if (candidate.ownHotkey) backend.setHotkey(id, "")
-        else if (candidate.hotkeyBind) backend.updateCommand(id, function(s) {
+        // The omacast hotkey is dropped; a Hyprland bind is unbound.
+        if (!removeBind) removeBind = candidate.hotkeyBinds[0] || ""
+        if (!removeBind || candidate.hotkeyBinds.indexOf(removeBind) < 0) throw new Error(candidate.title + " has no such hotkey")
+        if (candidate.ownHotkey && Keybindings.sameChord(candidate.ownHotkey, removeBind)) backend.setHotkey(id, "")
+        else backend.updateCommand(id, function(s) {
           var removed = (s.removedBinds || []).slice()
-          if (removed.indexOf(candidate.hotkeyBind) < 0) removed.push(candidate.hotkeyBind)
+          if (removed.indexOf(removeBind) < 0) removed.push(removeBind)
           s.removedBinds = removed
           return s
         })
-        else throw new Error(candidate.title + " has no hotkey")
         return { toast: { style: "success", title: "Hotkey removed" } }
       case "restore-hotkey":
         backend.updateCommand(id, function(s) { delete s.removedBinds; return s })

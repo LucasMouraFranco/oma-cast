@@ -23,6 +23,9 @@ const RECORDS = [
   "SUPER SHIFT + R                     → SSH\texec\talacritty -e ssh box"
 ].join("\n")
 
+// The main bind of each row (appHotkeys/commandHotkeys list them all).
+const first = (map) => Object.fromEntries(Object.entries(map).map(([id, chords]) => [id, chords[0]]))
+
 const DEFAULTS = { terminal: "com.mitchellh.ghostty.desktop", browser: "zen.desktop", editor: "nvim" }
 
 const ENTRIES = [
@@ -44,13 +47,14 @@ const ENTRIES = [
 test("parses Omarchy's keybinding records", () => {
   const r = K.parseRecords(RECORDS)
   assert.equal(r.length, 17)
-  assert.deepEqual(r[2], { chord: "SUPER SHIFT + RETURN", description: "Browser", dispatcher: "exec", arg: "omarchy-launch-browser" })
+  assert.deepEqual(r[2], { chord: "SUPER SHIFT + RETURN", chords: ["SUPER SHIFT + RETURN"], description: "Browser", dispatcher: "exec", arg: "omarchy-launch-browser" })
   assert.equal(r[4].chord, "SUPER + W", "the first of several chords")
+  assert.deepEqual(r[4].chords, ["SUPER + W", "SUPER + Q"])
   assert.equal(r[9].arg, "omarchy-launch-webapp 'https://chatgpt.com'")
 })
 
 test("each app gets the bind that opens it", () => {
-  const hotkeys = K.appHotkeys(K.parseRecords(RECORDS), ENTRIES, DEFAULTS)
+  const hotkeys = first(K.appHotkeys(K.parseRecords(RECORDS), ENTRIES, DEFAULTS))
   assert.deepEqual(hotkeys, {
     "com.mitchellh.ghostty": "SUPER + RETURN",
     zen: "SUPER SHIFT + RETURN",
@@ -67,7 +71,7 @@ test("each app gets the bind that opens it", () => {
 
 test("the terminal and browser binds follow the defaults", () => {
   const records = K.parseRecords(RECORDS)
-  const swapped = K.appHotkeys(records, ENTRIES, { terminal: "foot.desktop", browser: "" })
+  const swapped = first(K.appHotkeys(records, ENTRIES, { terminal: "foot.desktop", browser: "" }))
   assert.equal(swapped.foot, "SUPER + RETURN")
   assert.equal(swapped["com.mitchellh.ghostty"], undefined)
   assert.equal(swapped.zen, undefined, "no default browser, no browser hotkey")
@@ -79,11 +83,17 @@ test("binds that run a task, not the app, mark nothing", () => {
   assert.equal(hotkeys.hyprpicker, undefined, "a pipeline")
 })
 
-test("the first bind for an app wins", () => {
+test("an app lists every bind that opens it, the first one first", () => {
   const records = K.parseRecords(RECORDS)
-  assert.equal(K.appHotkeys(records, ENTRIES, DEFAULTS).zen, "SUPER SHIFT + RETURN")
+  assert.deepEqual(K.appHotkeys(records, ENTRIES, DEFAULTS).zen, ["SUPER SHIFT + RETURN", "SUPER SHIFT + B"])
   const reversed = records.slice().reverse()
-  assert.equal(K.appHotkeys(reversed, ENTRIES, DEFAULTS).zen, "SUPER SHIFT + B")
+  assert.deepEqual(K.appHotkeys(reversed, ENTRIES, DEFAULTS).zen, ["SUPER SHIFT + B", "SUPER SHIFT + RETURN"])
+  // Both chords of "SUPER SHIFT + Q / XF86Calculator", and one key spelled twice counts once.
+  const calc = K.parseRecords([
+    "SUPER SHIFT + Q / XF86Calculator    → Calculator\texec\tomacalc",
+    "SHIFT SUPER + Q                     → Calculator\texec\tomacalc"
+  ].join("\n"))
+  assert.deepEqual(K.appHotkeys(calc, ENTRIES, DEFAULTS).omacalc, ["SUPER SHIFT + Q", "XF86Calculator"])
 })
 
 test("chords render as keycaps in one modifier order", () => {
@@ -202,7 +212,7 @@ test("an exec bind marks the Omarchy menu command that runs the same command", (
     { id: "omarchy:trigger.other", action: "omarchy-shell shell summon someone.else '{}'" },
     { id: "omarchy:no-action" }
   ]
-  const hotkeys = K.commandHotkeys(records, menu)
+  const hotkeys = first(K.commandHotkeys(records, menu))
   assert.deepEqual(hotkeys, {
     "omarchy:trigger.proofread": "SUPER CTRL + P",
     "omarchy:trigger.capture.color": "SUPER + PRINT"
@@ -211,13 +221,13 @@ test("an exec bind marks the Omarchy menu command that runs the same command", (
   assert.equal(K.bindString(hotkeys["omarchy:trigger.proofread"]), "SUPER + CTRL + P")
 })
 
-test("the first bind for a menu command wins, and only exec binds count", () => {
+test("a menu command lists its binds in order, and only exec binds count", () => {
   const records = K.parseRecords([
     "SUPER + W                           → Close\tlua\tomarchy-menu",
     "SUPER + SPACE                       → Menu\texec\tomarchy-menu",
     "SUPER ALT + SPACE                   → Menu\texec\tomarchy-menu"
   ].join("\n"))
-  assert.deepEqual(K.commandHotkeys(records, [{ id: "omarchy:menu", action: "omarchy-menu" }]), { "omarchy:menu": "SUPER + SPACE" })
+  assert.deepEqual(K.commandHotkeys(records, [{ id: "omarchy:menu", action: "omarchy-menu" }]), { "omarchy:menu": ["SUPER + SPACE", "SUPER ALT + SPACE"] })
 })
 
 test("shell shortcuts mark the menu, panel or built-in they open", () => {
@@ -243,7 +253,7 @@ test("shell shortcuts mark the menu, panel or built-in they open", () => {
     { id: "builtin:emoji-picker" },
     { id: "builtin:clipboard-history" }
   ]
-  assert.deepEqual(K.commandHotkeys(records, cands), {
+  assert.deepEqual(first(K.commandHotkeys(records, cands)), {
     "omarchy:system": "SUPER + ESCAPE",
     "omarchy:trigger.capture": "SUPER CTRL + C",
     "omarchy:trigger.reminder.set": "SUPER CTRL + R",
@@ -257,5 +267,23 @@ test("shell shortcuts mark the menu, panel or built-in they open", () => {
 test("a route names the menu with that id before one with that alias", () => {
   const records = K.parseRecords('SUPER + A                           → A\tlua\thl.dsp.global("omarchy:menu.apps")')
   const cands = [{ id: "omarchy:other", menuId: "other", aliases: ["apps"] }, { id: "omarchy:apps", menuId: "apps" }]
-  assert.deepEqual(K.commandHotkeys(records, cands), { "omarchy:apps": "SUPER + A" })
+  assert.deepEqual(K.commandHotkeys(records, cands), { "omarchy:apps": ["SUPER + A"] })
+})
+
+test("a menu command gets its exec bind and the shortcut that opens it", () => {
+  const records = K.parseRecords([
+    'SUPER CTRL + V                      → Clipboard manager\tlua\thl.dsp.global("omarchy:panel.omarchy.clipboard")',
+    "SUPER SHIFT + V                     → Clipboard\texec\tomarchy-shell shell summon omarchy.clipboard"
+  ].join("\n"))
+  const cands = [{ id: "omarchy:trigger.clipboard-history", action: "omarchy-shell shell summon omarchy.clipboard" }]
+  assert.deepEqual(K.commandHotkeys(records, cands), { "omarchy:trigger.clipboard-history": ["SUPER CTRL + V", "SUPER SHIFT + V"] })
+})
+
+test("keycaps draw Linux key icons and keep the rest as text", () => {
+  assert.equal(K.keyGlyph("Super"), "❖")
+  assert.equal(K.keyGlyph("Shift").codePointAt(0), 0xf0636)
+  assert.equal(K.keyGlyph("↵").codePointAt(0), 0xf0311)
+  assert.equal(K.keyGlyph(K.formatChord("XF86AudioRaiseVolume")).codePointAt(0), 0xf057e)
+  assert.equal(K.keyGlyph("Ctrl"), "")
+  assert.equal(K.keyGlyph("V"), "")
 })

@@ -1,5 +1,6 @@
 import QtQuick
 import qs.Commons
+import "../core/Keybindings.js" as Keybindings
 
 Row {
   id: hint
@@ -22,11 +23,12 @@ Row {
       radius: Math.round(Style.space(4) * hint.zoom)
       color: Util.alpha(hint.color, 0.1)
 
+      // Super, Shift, ↵, arrows and media keys draw as icons (Keybindings.keyGlyph).
       Text {
         id: label
         anchors.centerIn: parent
         textFormat: Text.PlainText
-        text: parent.modelData
+        text: Keybindings.keyGlyph(parent.modelData) || parent.modelData
         color: hint.color
         opacity: 0.75
         font.family: hint.fontFamily

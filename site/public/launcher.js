@@ -190,21 +190,26 @@
     if (this.onTheme) this.onTheme(this.theme())
   }
 
+  // A row's Hyprland binds (Backend.qml setHotkeys).
+  function setHotkeys(candidate, chords) {
+    if (!chords || !chords.length) return
+    candidate.hotkeys = chords.map(Keybindings.formatChord)
+    candidate.hotkeyBinds = chords.map(Keybindings.bindString)
+  }
+
   Backend.prototype.rebuildCandidates = function () {
     var records = this.stores && this.stores.settings.doc ? this.bindRecords() : Keybindings.parseRecords(BIND_RECORDS)
     var hotkeys = Keybindings.appHotkeys(records, APPS, BIND_DEFAULTS)
     var next = APPS.map(function (app) {
       var c = RootSearch.appCandidate({ id: app.id, name: app.name, genericName: app.generic, keywords: app.keywords })
       c.glyph = app.glyph
-      if (hotkeys[app.id]) { c.hotkey = Keybindings.formatChord(hotkeys[app.id]); c.hotkeyBind = Keybindings.bindString(hotkeys[app.id]) }
+      setHotkeys(c, hotkeys[app.id])
       return c
     })
     var commands = RootSearch.menuCandidates(this.data.tree, this.data.guards, this.data.providerItems, deps)
     RootSearch.BUILTINS.forEach(function (def) { commands.push(RootSearch.builtinCandidate(def)) })
     var commandHotkeys = Keybindings.commandHotkeys(records, commands)
-    commands.forEach(function (c) {
-      if (commandHotkeys[c.id]) { c.hotkey = Keybindings.formatChord(commandHotkeys[c.id]); c.hotkeyBind = Keybindings.bindString(commandHotkeys[c.id]) }
-    })
+    commands.forEach(function (c) { setHotkeys(c, commandHotkeys[c.id]) })
     next = next.concat(commands)
     var superseded = {}
     RootSearch.BUILTINS.forEach(function (d) { (d.supersedes || []).forEach(function (id) { superseded[id] = true }) })
@@ -580,6 +585,8 @@
       }
       throw new Error("Cannot open " + id)
     }
+    var removeBind = ""
+    if (action.indexOf("remove-hotkey:") === 0) { removeBind = action.slice("remove-hotkey:".length); action = "remove-hotkey" }
     switch (action) {
       case "open-new":
         this.recordVisit(id, query)
@@ -603,10 +610,12 @@
       case "set-alias": return { push: { kind: "alias", commandId: id, title: "Alias for " + candidate.title, value: candidate.alias } }
       case "set-hotkey": return { push: { kind: "hotkey", commandId: id, title: "Hotkey for " + candidate.title, value: candidate.ownHotkey } }
       case "remove-hotkey":
-        if (candidate.ownHotkey) this.setHotkey(id, "")
-        else if (candidate.hotkeyBind) this.updateCommand(id, function (s) {
+        if (!removeBind) removeBind = candidate.hotkeyBinds[0] || ""
+        if (!removeBind || candidate.hotkeyBinds.indexOf(removeBind) < 0) throw new Error(candidate.title + " has no such hotkey")
+        if (candidate.ownHotkey && Keybindings.sameChord(candidate.ownHotkey, removeBind)) this.setHotkey(id, "")
+        else this.updateCommand(id, function (s) {
           var removed = (s.removedBinds || []).slice()
-          if (removed.indexOf(candidate.hotkeyBind) < 0) removed.push(candidate.hotkeyBind)
+          if (removed.indexOf(removeBind) < 0) removed.push(removeBind)
           s.removedBinds = removed
           return s
         })
@@ -796,12 +805,25 @@
   Launcher.prototype.rowData = function (c) {
     return {
       rowKind: c.kind === "calculator" ? "calculator" : "item", itemId: String(c.id || ""), title: String(c.title || ""), subtitle: String(c.subtitle || ""),
-      glyph: String(c.glyph || ""), typeLabel: String(c.typeLabel || ""), alias: String(c.alias || ""), hotkey: String(c.hotkey || ""),
+      glyph: String(c.glyph || ""), typeLabel: String(c.typeLabel || ""), alias: String(c.alias || ""), hotkeys: c.hotkeys || [],
       checked: !!c.checked, disabled: !!c.disabled, favorite: typeof c.favoriteOrder === "number" || !!c.pinned,
       calcInput: String(c.calcInput || ""), calcResult: String(c.calcResult || ""),
       calcInputCaption: String(c.calcInputCaption || ""), calcResultCaption: String(c.calcResultCaption || ""),
       args: c.arguments || [], iconless: c.kind === "theme"
     }
+  }
+
+  function keycaps(keys) {
+    return String(keys || "").split(" ").filter(Boolean).map(function (k) { return "<kbd>" + esc(k) + "</kbd>" }).join("")
+  }
+
+  // The main key and "+N" more; the selected row shows every key (CSS
+  // swaps the two, ResultRow.qml does the same).
+  function hotkeysHtml(hotkeys) {
+    if (!hotkeys.length) return ""
+    var one = '<span class="oc-hotkey oc-hk-one">' + keycaps(hotkeys[0]) + (hotkeys.length > 1 ? '<span class="oc-more">+' + (hotkeys.length - 1) + "</span>" : "") + "</span>"
+    if (hotkeys.length === 1) return one
+    return one + '<span class="oc-hotkey oc-hk-all">' + hotkeys.map(keycaps).join('<span class="oc-or">or</span>') + "</span>"
   }
 
   Launcher.prototype.renderRows = function () {
@@ -823,7 +845,7 @@
         (r.iconless ? "" : '<span class="oc-ic">' + esc(r.glyph) + "</span>") +
         '<span class="oc-t"><b>' + esc(r.title) + "</b>" + (r.subtitle ? "<span>" + esc(r.subtitle) + "</span>" : "") + "</span>" +
         '<span class="oc-acc">' + (r.alias ? '<span class="oc-alias">' + esc(r.alias) + "</span>" : "") +
-        (r.hotkey ? '<span class="oc-hotkey">' + r.hotkey.split(" ").map(function (k) { return "<kbd>" + esc(k) + "</kbd>" }).join("") + "</span>" : "") +
+        hotkeysHtml(r.hotkeys) +
         (r.favorite ? '<span class="oc-fav">' + GLYPH.star + "</span>" : "") + (r.checked ? '<span class="oc-check">✓</span>' : "") +
         '<span class="oc-ty">' + esc(r.typeLabel) + "</span></span></div>"
     })
@@ -1011,11 +1033,11 @@
     var html = "", p = this.popup
     if (p) {
       var needle = p.filter.trim().toLowerCase()
-      p.visible = p.items.filter(function (a) { return !needle || a.title.toLowerCase().indexOf(needle) >= 0 })
+      p.visible = p.items.filter(function (a) { return !needle || (a.title + " " + (a.keywords || "")).toLowerCase().indexOf(needle) >= 0 })
       p.selected = Math.max(0, Math.min(p.visible.length - 1, p.selected))
       html += '<div class="oc-panel oc-panel-' + p.kind + '"><div class="oc-panel-list">' + (p.visible.length ? p.visible.map(function (a, i) {
         var sep = i > 0 && p.visible[i - 1].section !== a.section ? " oc-sep" : ""
-        return '<div class="oc-act' + sep + (i === p.selected ? " oc-sel" : "") + '" data-a="' + i + '"><span class="oc-act-ic">' + esc(a.mark || "") + "</span><span>" + esc(a.title) + "</span>" +
+        return '<div class="oc-act' + sep + (i === p.selected ? " oc-sel" : "") + '" data-a="' + i + '"><span class="oc-act-ic">' + esc(a.mark || "") + "</span><span>" + esc(a.title) + (a.keys ? ' <span class="oc-hotkey">' + keycaps(a.keys) + "</span>" : "") + "</span>" +
           '<span class="oc-keys">' + String(a.shortcut || "").split(" ").filter(Boolean).map(function (k) { return "<kbd>" + esc(k) + "</kbd>" }).join("") + "</span></div>"
       }).join("") : '<div class="oc-none">No actions</div>') + "</div>" +
         (this.interactive ? '<input class="oc-panel-filter" type="text" tabindex="-1" placeholder="' + esc(p.placeholder) + '" aria-label="' + esc(p.placeholder) + '" autocomplete="off" autocapitalize="off" spellcheck="false">'
@@ -1059,7 +1081,7 @@
     if (this.popup) { var was = this.popup.kind; this.closePopups(); if (was === "actions") return }
     var actions = this.actionsForSelected(), self = this
     if (!actions.length) return
-    this.openPopup("actions", actions.map(function (a) { return { id: a.id, title: a.title, shortcut: a.shortcut, section: a.section, mark: a.icon === "✓" ? "✓" : "" } }),
+    this.openPopup("actions", actions.map(function (a) { return { id: a.id, title: a.title, shortcut: a.shortcut, section: a.section, keys: a.keys || "", keywords: a.keywords || "", mark: a.icon === "✓" ? "✓" : "" } }),
       "Search for actions…", 0, function (id) { self.perform(id) })
   }
 
