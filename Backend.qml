@@ -121,15 +121,16 @@ Item {
       if (chord) { app.hotkey = Keybindings.formatChord(chord); app.hotkeyBind = Keybindings.bindString(chord) }
       next.push(app)
     }
-    var menu = RootSearch.menuCandidates(menuSource.tree, menuSource.guards, menuSource.providerItems, backend.deps)
-    // The same for Omarchy menu commands whose action is the bind's command.
-    var commandHotkeys = Keybindings.commandHotkeys(keybindingSource.records, menu)
-    for (var m = 0; m < menu.length; m++) {
-      var menuChord = commandHotkeys[menu[m].id]
-      if (menuChord) { menu[m].hotkey = Keybindings.formatChord(menuChord); menu[m].hotkeyBind = Keybindings.bindString(menuChord) }
+    var commands = RootSearch.menuCandidates(menuSource.tree, menuSource.guards, menuSource.providerItems, backend.deps)
+    for (var b = 0; b < RootSearch.BUILTINS.length; b++) commands.push(RootSearch.builtinCandidate(RootSearch.BUILTINS[b]))
+    // The same for commands: the bind that runs a menu command, opens a menu
+    // or panel, or fires one of omacast's own shortcuts.
+    var commandHotkeys = Keybindings.commandHotkeys(keybindingSource.records, commands)
+    for (var m = 0; m < commands.length; m++) {
+      var commandChord = commandHotkeys[commands[m].id]
+      if (commandChord) { commands[m].hotkey = Keybindings.formatChord(commandChord); commands[m].hotkeyBind = Keybindings.bindString(commandChord) }
     }
-    next = next.concat(menu)
-    for (var b = 0; b < RootSearch.BUILTINS.length; b++) next.push(RootSearch.builtinCandidate(RootSearch.BUILTINS[b]))
+    next = next.concat(commands)
     // A built-in that replaces an Omarchy command hides that command.
     var superseded = ({})
     RootSearch.BUILTINS.forEach(function(d) { (d.supersedes || []).forEach(function(id) { superseded[id] = true }) })

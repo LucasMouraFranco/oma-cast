@@ -219,3 +219,43 @@ test("the first bind for a menu command wins, and only exec binds count", () => 
   ].join("\n"))
   assert.deepEqual(K.commandHotkeys(records, [{ id: "omarchy:menu", action: "omarchy-menu" }]), { "omarchy:menu": "SUPER + SPACE" })
 })
+
+test("shell shortcuts mark the menu, panel or built-in they open", () => {
+  const records = K.parseRecords([
+    'SUPER + ESCAPE                      → System menu\tlua\thl.dsp.global("omarchy:menu.system")',
+    'SUPER CTRL + C                      → Capture menu\tlua\thl.dsp.global("omarchy:menu.capture")',
+    'SUPER CTRL + R                      → Set reminder\tlua\thl.dsp.global("omarchy:menu.reminder-set")',
+    'SUPER SHIFT + SPACE                 → Omarchy menu\tlua\thl.dsp.global("omarchy:menu.root")',
+    'SUPER CTRL + V                      → Clipboard manager\tlua\thl.dsp.global("omarchy:panel.omarchy.clipboard")',
+    'SUPER CTRL + SPACE                  → Emoji\tlua\thl.dsp.global("omacast:emoji")',
+    'SUPER + F                           → Full screen\tlua\thl.dsp.window.fullscreen({ mode = "fullscreen" })',
+    'SUPER CTRL + X                      → Share\texec\tomarchy-menu share'
+  ].join("\n"))
+  const cands = [
+    { id: "omarchy:system", menuId: "system", aliases: ["power-menu"] },
+    { id: "omarchy:trigger.capture", menuId: "trigger.capture", aliases: ["capture", "screenshot"] },
+    { id: "omarchy:trigger.reminder.set", menuId: "trigger.reminder.set", aliases: ["reminder-set"], action: "omarchy-reminder -i" },
+    { id: "omarchy:trigger.share", menuId: "trigger.share", aliases: ["share"] },
+    { id: "omarchy:trigger.clipboard-history", menuId: "trigger.clipboard-history", action: "omarchy-shell shell summon omarchy.clipboard" },
+    // A payload makes it another view, not the panel the shortcut toggles.
+    { id: "omarchy:appearance.theme", menuId: "appearance.theme", action: "omarchy-shell shell summon omarchy.image-picker '{\"source\":\"themes\"}'" },
+    { id: "builtin:omarchy-menu" },
+    { id: "builtin:emoji-picker" },
+    { id: "builtin:clipboard-history" }
+  ]
+  assert.deepEqual(K.commandHotkeys(records, cands), {
+    "omarchy:system": "SUPER + ESCAPE",
+    "omarchy:trigger.capture": "SUPER CTRL + C",
+    "omarchy:trigger.reminder.set": "SUPER CTRL + R",
+    "omarchy:trigger.share": "SUPER CTRL + X",
+    "omarchy:trigger.clipboard-history": "SUPER CTRL + V",
+    "builtin:omarchy-menu": "SUPER SHIFT + SPACE",
+    "builtin:emoji-picker": "SUPER CTRL + SPACE"
+  })
+})
+
+test("a route names the menu with that id before one with that alias", () => {
+  const records = K.parseRecords('SUPER + A                           → A\tlua\thl.dsp.global("omarchy:menu.apps")')
+  const cands = [{ id: "omarchy:other", menuId: "other", aliases: ["apps"] }, { id: "omarchy:apps", menuId: "apps" }]
+  assert.deepEqual(K.commandHotkeys(records, cands), { "omarchy:apps": "SUPER + A" })
+})

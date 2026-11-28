@@ -162,6 +162,8 @@ function menuCandidate(tree, item, guards, deps) {
     keywords: keywords,
     typeLabel: item.kind === "action" ? "Command" : "Menu",
     menuId: item.id,
+    // Routes an Omarchy shortcut can open this menu by (Keybindings.commandHotkeys).
+    aliases: item.aliases,
     action: item.action,
     target: item.target,
     provider: item.provider,

@@ -201,25 +201,100 @@ function commandSignature(command) {
   return "s:" + String(command || "").trim().replace(/\s+/g, " ")
 }
 
-// commandId -> chord, for every Omarchy menu command an exec bind runs as
-// is: "omarchy-shell shell summon x '{}'" on Super+Ctrl+P marks the menu row
-// with that action. Only the whole command counts, so a bind that opens an
-// app never lands on a command that merely starts the same program with
-// other arguments. The first bind wins, as in appHotkeys.
+// Omarchy's menu route spelling: "reminder_set" and "Reminder-Set" are one.
+function routeKey(route) {
+  var r = String(route || "").toLowerCase().replace(/_/g, "-")
+  return "route:" + (r === "go" || r === "menu" ? "root" : r)
+}
+
+// A plugin the shell summons with no payload: "omarchy-shell shell summon
+// omarchy.clipboard" opens the same panel as the omarchy:panel.omarchy.clipboard
+// shortcut. A payload ('{"source":"themes"}') makes it a different view.
+function summonKey(words) {
+  if (!words || words.length < 4 || words.length > 5) return ""
+  if (basename(words[0]) !== "omarchy-shell" || words[1] !== "shell" || words[2] !== "summon") return ""
+  if (words.length === 5 && words[4] !== "{}") return ""
+  return "summon:" + words[3]
+}
+
+// omacast's own global shortcuts (Launcher.qml) and the built-in each opens.
+var OMACAST_SHORTCUTS = {
+  theme: "builtin:switch-theme",
+  clipboard: "builtin:clipboard-history",
+  emoji: "builtin:emoji-picker",
+  snippets: "builtin:search-snippets"
+}
+
+// What a bind does, as keys a row can answer to: the command it runs, the
+// menu route or panel a shell shortcut (hl.dsp.global) opens, or one of
+// omacast's own shortcuts.
+function recordKeys(r) {
+  if (r.dispatcher === "exec" && r.arg) {
+    var keys = [commandSignature(r.arg)]
+    var words = splitCommand(r.arg)
+    if (words) {
+      var w = unwrap(words)
+      if (w.length === 2 && basename(w[0]) === "omarchy-menu") keys.push(routeKey(w[1]))
+      var summon = summonKey(w)
+      if (summon) keys.push(summon)
+    }
+    return keys
+  }
+  var m = /^hl\.dsp\.global\("([^"]+)"\)$/.exec(String(r.arg || "").trim())
+  if (!m) return []
+  var name = m[1]
+  if (/^omarchy:menu\./.test(name)) return [routeKey(name.slice("omarchy:menu.".length))]
+  if (/^omarchy:panel\./.test(name)) return ["summon:" + name.slice("omarchy:panel.".length)]
+  if (/^omacast:/.test(name)) return [name]
+  return []
+}
+
+// commandId -> chord, for every command a bind runs or opens:
+//   - an Omarchy menu command whose action is the bind's command, compared
+//     as a whole after quoting, so "omarchy-shell shell summon x '{}'" on
+//     Super+Ctrl+P marks the menu row with that action, while a bind that
+//     opens an app never lands on a command that starts the same program
+//     with other arguments
+//   - a menu a shell shortcut opens (omarchy:menu.system → System), by id
+//     first and then by alias, the way Omarchy's menu resolves a route
+//   - a menu command that summons the panel a shortcut toggles
+//   - the built-in an omacast shortcut opens (omacast:emoji → Emoji)
+// Several rows that run the same command (a toggle's on and off rows) all
+// get the bind. The first bind for a row wins, as in appHotkeys.
 function commandHotkeys(records, candidates) {
-  var bySig = {}
+  var index = {}
+  function add(key, id) {
+    if (!key) return
+    if (!index[key]) index[key] = []
+    if (index[key].indexOf(id) < 0) index[key].push(id)
+  }
+  var cands = (candidates || []).filter(function(c) { return c && c.id })
+  var byId = {}
+  cands.forEach(function(c) {
+    byId[c.id] = true
+    if (!c.action) return
+    add(commandSignature(c.action), c.id)
+    var words = splitCommand(c.action)
+    if (words) add(summonKey(unwrap(words)), c.id)
+  })
+  // A route names one menu: the item with that id, else the first alias.
+  var routes = {}
+  cands.forEach(function(c) { if (c.menuId) routes[routeKey(c.menuId)] = routes[routeKey(c.menuId)] || c.id })
+  cands.forEach(function(c) {
+    (c.aliases || []).forEach(function(a) { var k = routeKey(a); if (!routes[k]) routes[k] = c.id })
+  })
+  if (byId["builtin:omarchy-menu"]) routes["route:root"] = "builtin:omarchy-menu"
+  for (var key in routes) add(key, routes[key])
+  for (var name in OMACAST_SHORTCUTS) if (byId[OMACAST_SHORTCUTS[name]]) add("omacast:" + name, OMACAST_SHORTCUTS[name])
+
+  var out = {}
   for (var i = 0; i < (records || []).length; i++) {
     var r = records[i]
-    if (r.dispatcher !== "exec" || !r.arg) continue
-    var sig = commandSignature(r.arg)
-    if (sig && !(sig in bySig)) bySig[sig] = r.chord
-  }
-  var out = {}
-  for (var c = 0; c < (candidates || []).length; c++) {
-    var cand = candidates[c]
-    if (!cand || !cand.id || !cand.action) continue
-    var s = commandSignature(cand.action)
-    if (s && s in bySig) out[String(cand.id)] = bySig[s]
+    var keys = recordKeys(r)
+    for (var k = 0; k < keys.length; k++) {
+      var ids = index[keys[k]] || []
+      for (var j = 0; j < ids.length; j++) if (!(ids[j] in out)) out[ids[j]] = r.chord
+    }
   }
   return out
 }
