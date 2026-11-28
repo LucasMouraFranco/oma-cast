@@ -16,11 +16,12 @@ function parseRecords(text) {
     var head = fields[0]
     var arrow = head.indexOf(" → ")
     if (arrow < 0) continue
-    // "SUPER + W / SUPER + Q" lists two chords for one action; the first is enough.
-    var chord = head.slice(0, arrow).trim().split(" / ")[0].trim()
-    if (!chord) continue
+    // "SUPER + W / SUPER + Q" lists two chords for one action.
+    var chords = head.slice(0, arrow).trim().split(" / ").map(function(c) { return c.trim() }).filter(function(c) { return c })
+    if (!chords.length) continue
     out.push({
-      chord: chord,
+      chord: chords[0],
+      chords: chords,
       description: head.slice(arrow + 3).trim(),
       dispatcher: fields[1].trim(),
       arg: fields.slice(2).join("\t").trim()
@@ -167,9 +168,20 @@ function entryKeys(entry, defaults) {
   return keys
 }
 
-// desktop id -> chord, for every entry an exec bind opens. Records come in
-// the order Omarchy's menu lists them (most important first), so the first
-// bind for an app wins: Super+Shift+Return over Super+Shift+B for the browser.
+// Adds a record's chords to a list, skipping keys already in it however
+// they're spelled.
+function addChords(list, record) {
+  var chords = record.chords || [record.chord]
+  for (var i = 0; i < chords.length; i++) {
+    if (!formatChord(chords[i])) continue
+    if (!list.some(function(c) { return sameChord(c, chords[i]) })) list.push(chords[i])
+  }
+}
+
+// desktop id -> [chord], every bind that opens each entry. Records come in
+// the order Omarchy's menu lists them (most important first), so the list
+// starts with the main one: Super+Shift+Return before Super+Shift+B for the
+// browser. Mouse binds are left out.
 function appHotkeys(records, entries, defaults) {
   var byKey = {}
   for (var i = 0; i < (records || []).length; i++) {
@@ -178,15 +190,127 @@ function appHotkeys(records, entries, defaults) {
     var words = splitCommand(r.arg)
     if (!words) continue
     var keys = commandKeys(words, defaults, true)
-    for (var k = 0; k < keys.length; k++) if (!(keys[k] in byKey)) byKey[keys[k]] = r.chord
+    for (var k = 0; k < keys.length; k++) addChords(byKey[keys[k]] = byKey[keys[k]] || [], r)
   }
   var out = {}
   for (var e = 0; e < (entries || []).length; e++) {
     var entry = entries[e]
     if (!entry || !entry.id) continue
     var ek = entryKeys(entry, defaults)
-    // The id beats the program: a terminal bind names Ghostty's desktop id.
-    for (var j = 0; j < ek.length; j++) if (ek[j] in byKey) { out[String(entry.id)] = byKey[ek[j]]; break }
+    // The id beats the program: a terminal bind names Ghostty's desktop id,
+    // so its binds come first.
+    var list = []
+    for (var j = 0; j < ek.length; j++) (byKey[ek[j]] || []).forEach(function(c) { addChords(list, { chord: c }) })
+    if (list.length) out[String(entry.id)] = list
+  }
+  return out
+}
+
+// One spelling for a command line, so a bind and a menu action that run the
+// same thing compare equal however they quote or space it. Lines with shell
+// syntax (pipes, ||, ;) can't be split into words; they compare by their
+// text with runs of whitespace collapsed.
+function commandSignature(command) {
+  var words = splitCommand(command)
+  if (words) return words.length ? "w:" + unwrap(words).join("\u0000") : ""
+  return "s:" + String(command || "").trim().replace(/\s+/g, " ")
+}
+
+// Omarchy's menu route spelling: "reminder_set" and "Reminder-Set" are one.
+function routeKey(route) {
+  var r = String(route || "").toLowerCase().replace(/_/g, "-")
+  return "route:" + (r === "go" || r === "menu" ? "root" : r)
+}
+
+// A plugin the shell summons with no payload: "omarchy-shell shell summon
+// omarchy.clipboard" opens the same panel as the omarchy:panel.omarchy.clipboard
+// shortcut. A payload ('{"source":"themes"}') makes it a different view.
+function summonKey(words) {
+  if (!words || words.length < 4 || words.length > 5) return ""
+  if (basename(words[0]) !== "omarchy-shell" || words[1] !== "shell" || words[2] !== "summon") return ""
+  if (words.length === 5 && words[4] !== "{}") return ""
+  return "summon:" + words[3]
+}
+
+// omacast's own global shortcuts (Launcher.qml) and the built-in each opens.
+var OMACAST_SHORTCUTS = {
+  theme: "builtin:switch-theme",
+  clipboard: "builtin:clipboard-history",
+  emoji: "builtin:emoji-picker",
+  snippets: "builtin:search-snippets"
+}
+
+// What a bind does, as keys a row can answer to: the command it runs, the
+// menu route or panel a shell shortcut (hl.dsp.global) opens, or one of
+// omacast's own shortcuts.
+function recordKeys(r) {
+  if (r.dispatcher === "exec" && r.arg) {
+    var keys = [commandSignature(r.arg)]
+    var words = splitCommand(r.arg)
+    if (words) {
+      var w = unwrap(words)
+      if (w.length === 2 && basename(w[0]) === "omarchy-menu") keys.push(routeKey(w[1]))
+      var summon = summonKey(w)
+      if (summon) keys.push(summon)
+    }
+    return keys
+  }
+  var m = /^hl\.dsp\.global\("([^"]+)"\)$/.exec(String(r.arg || "").trim())
+  if (!m) return []
+  var name = m[1]
+  if (/^omarchy:menu\./.test(name)) return [routeKey(name.slice("omarchy:menu.".length))]
+  if (/^omarchy:panel\./.test(name)) return ["summon:" + name.slice("omarchy:panel.".length)]
+  if (/^omacast:/.test(name)) return [name]
+  return []
+}
+
+// commandId -> chord, for every command a bind runs or opens:
+//   - an Omarchy menu command whose action is the bind's command, compared
+//     as a whole after quoting, so "omarchy-shell shell summon x '{}'" on
+//     Super+Ctrl+P marks the menu row with that action, while a bind that
+//     opens an app never lands on a command that starts the same program
+//     with other arguments
+//   - a menu a shell shortcut opens (omarchy:menu.system → System), by id
+//     first and then by alias, the way Omarchy's menu resolves a route
+//   - a menu command that summons the panel a shortcut toggles
+//   - the built-in an omacast shortcut opens (omacast:emoji → Emoji)
+// Several rows that run the same command (a toggle's on and off rows) all
+// get the bind. Returns commandId -> [chord], in Omarchy's order, as
+// appHotkeys does.
+function commandHotkeys(records, candidates) {
+  var index = {}
+  function add(key, id) {
+    if (!key) return
+    if (!index[key]) index[key] = []
+    if (index[key].indexOf(id) < 0) index[key].push(id)
+  }
+  var cands = (candidates || []).filter(function(c) { return c && c.id })
+  var byId = {}
+  cands.forEach(function(c) {
+    byId[c.id] = true
+    if (!c.action) return
+    add(commandSignature(c.action), c.id)
+    var words = splitCommand(c.action)
+    if (words) add(summonKey(unwrap(words)), c.id)
+  })
+  // A route names one menu: the item with that id, else the first alias.
+  var routes = {}
+  cands.forEach(function(c) { if (c.menuId) routes[routeKey(c.menuId)] = routes[routeKey(c.menuId)] || c.id })
+  cands.forEach(function(c) {
+    (c.aliases || []).forEach(function(a) { var k = routeKey(a); if (!routes[k]) routes[k] = c.id })
+  })
+  if (byId["builtin:omarchy-menu"]) routes["route:root"] = "builtin:omarchy-menu"
+  for (var key in routes) add(key, routes[key])
+  for (var name in OMACAST_SHORTCUTS) if (byId[OMACAST_SHORTCUTS[name]]) add("omacast:" + name, OMACAST_SHORTCUTS[name])
+
+  var out = {}
+  for (var i = 0; i < (records || []).length; i++) {
+    var r = records[i]
+    var keys = recordKeys(r)
+    for (var k = 0; k < keys.length; k++) {
+      var ids = index[keys[k]] || []
+      for (var j = 0; j < ids.length; j++) addChords(out[ids[j]] = out[ids[j]] || [], r)
+    }
   }
   return out
 }
@@ -204,7 +328,27 @@ var KEY_NAMES = {
   DELETE: "Del", INSERT: "Ins", HOME: "Home", END: "End", PRINT: "PrtSc",
   LEFT: "←", RIGHT: "→", UP: "↑", DOWN: "↓", PAGE_UP: "PgUp", PRIOR: "PgUp", PAGE_DOWN: "PgDn", NEXT: "PgDn",
   SLASH: "/", BACKSLASH: "\\", COMMA: ",", PERIOD: ".", SEMICOLON: ";", APOSTROPHE: "'", GRAVE: "`",
-  MINUS: "-", EQUAL: "=", BRACKETLEFT: "[", BRACKETRIGHT: "]", "~": "~"
+  MINUS: "-", EQUAL: "=", BRACKETLEFT: "[", BRACKETRIGHT: "]", "~": "~",
+  CAPS_LOCK: "CapsLock", XF86AUDIORAISEVOLUME: "VolUp", XF86AUDIOLOWERVOLUME: "VolDown", XF86AUDIOMUTE: "Mute",
+  XF86AUDIOMICMUTE: "MicMute", XF86MONBRIGHTNESSUP: "BrightUp", XF86MONBRIGHTNESSDOWN: "BrightDown",
+  XF86AUDIOPLAY: "Play", XF86AUDIOPAUSE: "Play", XF86AUDIONEXT: "Next", XF86AUDIOPREV: "Prev"
+}
+
+// Keycap labels drawn as an icon: JetBrainsMono Nerd Font glyphs (Omarchy's
+// default font) and ❖ for Super, Linux's usual mark for it. Labels missing
+// here (Ctrl, Alt, Esc, Del, letters) stay text. [D]
+var KEY_GLYPHS = {
+  Super: "\u2756", Shift: "\udb81\ude36", CapsLock: "\udb81\ude32", Tab: "\udb80\udf12", "↵": "\udb80\udf11",
+  "⌫": "\udb80\udc6e", Space: "\udb84\udc50", "↑": "\udb80\udc5d", "↓": "\udb80\udc45", "←": "\udb80\udc4d",
+  "→": "\udb80\udc54", Home: "\udb80\udc5b", End: "\udb80\udc43", PgUp: "\udb80\udd3f", PgDn: "\udb80\udd3c",
+  PrtSc: "\udb80\udd00", VolUp: "\udb81\udd7e", VolDown: "\udb81\udd80", Mute: "\udb81\udf5f",
+  MicMute: "\udb80\udf6d", BrightUp: "\udb80\udce0", BrightDown: "\udb80\udcde", Play: "\udb81\udc0e",
+  Next: "\udb81\udcad", Prev: "\udb81\udcae"
+}
+
+// The icon a keycap label is drawn as, or "" to draw the label itself.
+function keyGlyph(label) {
+  return KEY_GLYPHS.hasOwnProperty(label) ? KEY_GLYPHS[label] : ""
 }
 var MOD_NAMES = { SUPER: "Super", SHIFT: "Shift", CTRL: "Ctrl", CONTROL: "Ctrl", ALT: "Alt" }
 var MOD_ORDER = ["Super", "Ctrl", "Alt", "Shift"]
@@ -420,7 +564,10 @@ if (typeof module !== "undefined") {
     commandKeys: commandKeys,
     entryKeys: entryKeys,
     appHotkeys: appHotkeys,
+    commandSignature: commandSignature,
+    commandHotkeys: commandHotkeys,
     formatChord: formatChord,
+    keyGlyph: keyGlyph,
     parseScan: parseScan,
     splitChord: splitChord,
     bindString: bindString,

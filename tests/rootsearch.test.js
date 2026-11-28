@@ -119,23 +119,45 @@ test("hotkeys: own beats outside, and the actions follow", () => {
   const withK = Object.assign({ Keybindings: K }, deps)
   const plain = RS.appCandidate(apps[0])
   let ids = RS.actionsFor(RS.decorate(plain, ctx(), withK)).map((a) => a.id)
-  assert.ok(ids.includes("set-hotkey") && !ids.includes("remove-hotkey") && !ids.includes("restore-hotkey"))
+  assert.ok(ids.includes("set-hotkey") && !ids.some((id) => id.startsWith("remove-hotkey")) && !ids.includes("restore-hotkey"))
 
-  const bound = Object.assign({}, plain, { hotkey: "Super Shift ↵", hotkeyBind: "SUPER + SHIFT + RETURN" })
+  const bound = Object.assign({}, plain, { hotkeys: ["Super Shift ↵", "Super Shift B"], hotkeyBinds: ["SUPER + SHIFT + RETURN", "SUPER + SHIFT + B"] })
   let row = RS.decorate(bound, ctx(), withK)
   assert.equal(row.hotkey, "Super Shift ↵")
+  assert.deepEqual(row.hotkeys, ["Super Shift ↵", "Super Shift B"])
   assert.equal(RS.actionsFor(row).find((a) => a.id === "set-hotkey").title, "Record Hotkey")
-  assert.ok(RS.actionsFor(row).some((a) => a.id === "remove-hotkey"))
+  // One Remove per key, showing the key.
+  assert.deepEqual(RS.actionsFor(row).filter((a) => a.id.startsWith("remove-hotkey")).map((a) => [a.id, a.title, a.keys]), [
+    ["remove-hotkey:SUPER + SHIFT + RETURN", "Remove", "Super Shift ↵"],
+    ["remove-hotkey:SUPER + SHIFT + B", "Remove", "Super Shift B"]
+  ])
 
-  row = RS.decorate(bound, ctx({ commands: { [plain.id]: { hotkey: "SUPER + B", removedBinds: ["SUPER + SHIFT + B"] } } }), withK)
+  row = RS.decorate(bound, ctx({ commands: { [plain.id]: { hotkey: "SUPER + B", removedBinds: ["SUPER + SHIFT + X", "SUPER + SHIFT + Y"] } } }), withK)
   assert.equal(row.hotkey, "Super B")
   assert.equal(row.ownHotkey, "SUPER + B")
+  assert.deepEqual(row.hotkeyBinds, ["SUPER + B", "SUPER + SHIFT + RETURN", "SUPER + SHIFT + B"])
   ids = RS.actionsFor(row).map((a) => a.id)
-  assert.ok(ids.includes("remove-hotkey") && ids.includes("restore-hotkey"))
+  assert.ok(ids.includes("remove-hotkey:SUPER + B") && ids.includes("restore-hotkey"))
   assert.equal(RS.actionsFor(row).find((a) => a.id === "set-hotkey").title, "Change Hotkey")
-  assert.deepEqual(RS.aboutFor(row, NOW).filter((r) => /Hotkey|Bind/.test(r.label)), [
-    { label: "Hotkey", value: "Super B" }, { label: "Hyprland Bind", value: "Super Shift ↵" }
+  assert.equal(RS.actionsFor(row).find((a) => a.id === "restore-hotkey").title, "Restore Default Hotkeys")
+  assert.deepEqual(RS.aboutFor(row, NOW).filter((r) => /Hotkey|Bound/.test(r.label)), [
+    { label: "Hotkey", value: "Super B" }, { label: "Also Bound To", value: "Super Shift ↵, Super Shift B" }
   ])
+})
+
+test("hotkeys: a menu command's Hyprland bind shows, removes and yields to its own", () => {
+  const K = require("../core/Keybindings.js")
+  const withK = Object.assign({ Keybindings: K }, deps)
+  const lock = candidates().find((c) => c.id === "omarchy:system.lock")
+  const bound = Object.assign({}, lock, { hotkeys: ["Super Ctrl L"], hotkeyBinds: ["SUPER + CTRL + L"] })
+  let row = RS.decorate(bound, ctx(), withK)
+  assert.equal(row.hotkey, "Super Ctrl L")
+  assert.equal(row.externalHotkey, "Super Ctrl L")
+  assert.ok(RS.actionsFor(row).some((a) => a.id === "remove-hotkey:SUPER + CTRL + L"))
+
+  row = RS.decorate(bound, ctx({ commands: { [lock.id]: { hotkey: "SUPER + ALT + L", removedBinds: ["SUPER + CTRL + L"] } } }), withK)
+  assert.equal(row.hotkey, "Super Alt L")
+  assert.equal(RS.actionsFor(row).find((a) => a.id === "restore-hotkey").title, "Restore Default Hotkey")
 })
 
 test("actions: primary first, favourites and alias offered", () => {

@@ -162,6 +162,8 @@ function menuCandidate(tree, item, guards, deps) {
     keywords: keywords,
     typeLabel: item.kind === "action" ? "Command" : "Menu",
     menuId: item.id,
+    // Routes an Omarchy shortcut can open this menu by (Keybindings.commandHotkeys).
+    aliases: item.aliases,
     action: item.action,
     target: item.target,
     provider: item.provider,
@@ -221,11 +223,25 @@ function decorate(candidate, ctx, deps) {
   out.frecency = visits ? deps.Frecency.score(visits.anchor, ctx.nowMs / 1000) : 1
   out.openedAt = visits ? visits.openedAt : null
   out.searchTerms = visits && visits.searchTerms ? visits.searchTerms : []
-  // A hotkey set in omacast wins over the outside bind found for the row
-  // (Keybindings.appHotkeys); removedBinds are outside binds taken away.
+  // Every key that runs the row: a hotkey set in omacast first, then the
+  // Hyprland binds found for it (Keybindings.appHotkeys/commandHotkeys) in
+  // Omarchy's order. hotkeys are keycap labels, hotkeyBinds the same keys in
+  // Hyprland's spelling; hotkey is the main one. removedBinds are outside
+  // binds taken away.
   out.ownHotkey = settings.hotkey ? String(settings.hotkey) : ""
-  out.externalHotkey = candidate.hotkey || ""
-  out.hotkey = out.ownHotkey && deps.Keybindings ? deps.Keybindings.formatChord(out.ownHotkey) : out.externalHotkey
+  var shown = candidate.hotkeys || (candidate.hotkey ? [candidate.hotkey] : [])
+  var binds = candidate.hotkeyBinds || (candidate.hotkeyBind ? [candidate.hotkeyBind] : [])
+  out.externalHotkey = shown[0] || ""
+  out.hotkeys = []
+  out.hotkeyBinds = []
+  var own = out.ownHotkey && deps.Keybindings ? deps.Keybindings.formatChord(out.ownHotkey) : ""
+  if (own) { out.hotkeys.push(own); out.hotkeyBinds.push(deps.Keybindings.bindString(out.ownHotkey)) }
+  for (var h = 0; h < shown.length; h++) {
+    if (!shown[h] || out.hotkeys.indexOf(shown[h]) >= 0) continue
+    out.hotkeys.push(shown[h])
+    out.hotkeyBinds.push(binds[h] || "")
+  }
+  out.hotkey = out.hotkeys[0] || ""
   out.removedBinds = settings.removedBinds || []
   return out
 }
@@ -420,8 +436,14 @@ function actionsFor(candidate) {
   if (candidate.alias) list.push({ id: "remove-alias", title: "Remove Alias", shortcut: "", section: "configure", icon: "" })
   // Raycast's per-command hotkey (ref 04 §3 Extensions table), bound in Hyprland. [D]
   list.push({ id: "set-hotkey", title: candidate.ownHotkey ? "Change Hotkey" : "Record Hotkey", shortcut: "", section: "configure", icon: "\uf11c" })
-  if (candidate.hotkey) list.push({ id: "remove-hotkey", title: "Remove Hotkey", shortcut: "", section: "configure", icon: "\uf11c" })
-  if (candidate.removedBinds && candidate.removedBinds.length) list.push({ id: "restore-hotkey", title: "Restore Default Hotkey", shortcut: "", section: "configure", icon: "\uf11c" })
+  // One Remove per key, with its keycaps: "remove-hotkey:<bind>". [D]
+  var hotkeys = candidate.hotkeys || []
+  for (var h = 0; h < hotkeys.length; h++) {
+    var bind = (candidate.hotkeyBinds || [])[h]
+    if (bind) list.push({ id: "remove-hotkey:" + bind, title: "Remove", keys: hotkeys[h], keywords: "hotkey", shortcut: "", section: "configure", icon: "\uf00d" })
+  }
+  var removed = candidate.removedBinds || []
+  if (removed.length) list.push({ id: "restore-hotkey", title: removed.length > 1 ? "Restore Default Hotkeys" : "Restore Default Hotkey", shortcut: "", section: "configure", icon: "\uf0e2" })
   if (candidate.frecency > 1) list.push({ id: "reset-ranking", title: "Reset Ranking", shortcut: "", section: "configure", icon: "" })
   list.push({ id: "disable", title: "Disable Command", shortcut: "Alt Shift D", section: "delete", icon: "" })
   return list
@@ -502,7 +524,7 @@ function aboutFor(c, nowMs) {
   add("ID", c.id)
   if (c.kind === "app") add("Desktop Entry", c.appId + ".desktop")
   add("Hotkey", c.hotkey)
-  if (c.ownHotkey && c.externalHotkey && c.externalHotkey !== c.hotkey) add("Hyprland Bind", c.externalHotkey)
+  add("Also Bound To", (c.hotkeys || []).slice(1).join(", "))
   if (c.kind === "omarchy-action") add("Command", c.action)
   if (c.kind === "omarchy-link") add("Opens", c.target)
   if (c.kind === "script") { add("Script", c.script.path); add("Mode", c.script.mode) }

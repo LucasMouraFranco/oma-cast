@@ -249,16 +249,67 @@ Item {
         }
       }
 
-      // The Hyprland bind that opens this app, as keycaps (Raycast's hotkey
-      // accessory).
-      KeyHint {
-        visible: row.hotkey.length > 0
+      // The keys that run this row, as keycaps (Raycast's hotkey accessory):
+      // the main one and "+N" more, or every one on the selected row. [D]
+      Row {
+        id: hotkeyCaps
+        readonly property var keys: row.hotkey ? row.hotkey.split("\t") : []
+        readonly property bool expanded: row.selected && keys.length > 1
+        visible: keys.length > 0
         anchors.verticalCenter: parent.verticalCenter
-        keys: row.hotkey
-        color: row.look.foreground
-        fontFamily: row.look.fontFamily
-        pixelSize: Math.round(Style.font.caption * row.zoom)
-        zoom: row.zoom
+        spacing: row.px(6)
+
+        Repeater {
+          model: hotkeyCaps.expanded ? hotkeyCaps.keys : hotkeyCaps.keys.slice(0, 1)
+
+          Row {
+            required property string modelData
+            required property int index
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: row.px(6)
+
+            Text {
+              visible: parent.index > 0
+              anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
+              text: "or"
+              color: row.look.foreground
+              opacity: 0.45
+              font.family: row.look.fontFamily
+              font.pixelSize: Math.round(Style.font.caption * row.zoom)
+            }
+
+            KeyHint {
+              anchors.verticalCenter: parent.verticalCenter
+              keys: parent.modelData
+              color: row.look.foreground
+              fontFamily: row.look.fontFamily
+              pixelSize: Math.round(Style.font.caption * row.zoom)
+              zoom: row.zoom
+            }
+          }
+        }
+
+        Rectangle {
+          visible: !hotkeyCaps.expanded && hotkeyCaps.keys.length > 1
+          anchors.verticalCenter: parent.verticalCenter
+          height: moreText.implicitHeight + row.px(4)
+          width: moreText.implicitWidth + row.px(12)
+          radius: height / 2
+          color: "transparent"
+          border.width: 1
+          border.color: Util.alpha(row.look.foreground, 0.3)
+          Text {
+            id: moreText
+            anchors.centerIn: parent
+            textFormat: Text.PlainText
+            text: "+" + (hotkeyCaps.keys.length - 1)
+            color: row.look.foreground
+            opacity: 0.7
+            font.family: row.look.fontFamily
+            font.pixelSize: Math.round(Style.font.caption * row.zoom)
+          }
+        }
       }
 
       Text {

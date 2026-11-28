@@ -17,7 +17,7 @@ Rectangle {
 
   readonly property var visibleActions: {
     var f = panel.filter.trim().toLowerCase()
-    return panel.actions.filter(function(a) { return !f || a.title.toLowerCase().indexOf(f) >= 0 })
+    return panel.actions.filter(function(a) { return !f || (a.title + " " + (a.keywords || "")).toLowerCase().indexOf(f) >= 0 })
   }
 
   function move(delta) {
@@ -95,18 +95,36 @@ Rectangle {
           font.pixelSize: panel.px(13)
         }
 
-        Text {
+        Row {
           anchors.left: actionIcon.right
           anchors.leftMargin: panel.px(8)
           anchors.right: keys.left
           anchors.rightMargin: panel.px(8)
           anchors.verticalCenter: parent.verticalCenter
-          textFormat: Text.PlainText
-          text: modelData.title
-          color: panel.look.foreground
-          elide: Text.ElideRight
-          font.family: panel.look.fontFamily
-          font.pixelSize: Math.round(Style.font.body * panel.zoom)
+          spacing: panel.px(8)
+
+          Text {
+            id: actionTitle
+            anchors.verticalCenter: parent.verticalCenter
+            width: Math.min(implicitWidth, parent.width - (actionKeys.visible ? actionKeys.width + parent.spacing : 0))
+            textFormat: Text.PlainText
+            text: modelData.title
+            color: panel.look.foreground
+            elide: Text.ElideRight
+            font.family: panel.look.fontFamily
+            font.pixelSize: Math.round(Style.font.body * panel.zoom)
+          }
+
+          // The key an action is about ("Remove ❖ Ctrl V").
+          KeyHint {
+            id: actionKeys
+            visible: !!modelData.keys
+            anchors.verticalCenter: parent.verticalCenter
+            keys: modelData.keys || ""
+            color: panel.look.foreground
+            fontFamily: panel.look.fontFamily
+            zoom: panel.zoom
+          }
         }
 
         KeyHint {

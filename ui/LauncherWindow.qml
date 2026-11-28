@@ -394,7 +394,8 @@ PanelWindow {
       iconName: String(c.iconName || ""),
       typeLabel: String(c.typeLabel || ""),
       alias: String(c.alias || ""),
-      hotkey: String(c.hotkey || ""),
+      // Every key that runs the row, tab-separated, the main one first.
+      hotkey: (c.hotkeys || []).join("\t"),
       checked: !!c.checked,
       disabled: !!c.disabled,
       favorite: typeof c.favoriteOrder === "number" || !!c.pinned,
